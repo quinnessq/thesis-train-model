@@ -1,27 +1,24 @@
 import logging
+import os
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, TensorDataset
 
 # Configuration
 TEST_MODE = False  # Toggle for testing with limited data
-TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training.csv'  # Path to CSV file
+VALIDATION_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'  # Path to CSV file
 MODEL_PATH = 'lstm_model.pth'  # Path to save the model
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 BATCH_SIZE = 32  # Batch size for training
-EPOCHS = 10 if not TEST_MODE else 2  # Reduced epochs in test mode
-LEARNING_RATE = 0.0001  # Learning rate
-HIDDEN_SIZE = 64  # LSTM hidden layer size
-DROPOUT_RATE = 0.2  # Dropout rate for regularization
-RANDOM_STATE = 42  # Random seed
 SEQUENCE_LENGTH = 10  # Number of time steps per input sequence
-WEIGHT_DECAY = 1e-5  # L2 regularization weight decay due to limited scope of time series
-OUTPUT_SIZE = 2
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,7 +31,7 @@ logger.info(f"Using device: {device}")
 # Load and preprocess data
 logger.info("Loading data...")
 data = pd.read_csv(
-    TRAINING_DATA_PATH,
+    VALIDATION_DATA_PATH,
     quotechar='"',
     sep=",",
     encoding='utf-8',
@@ -65,47 +62,32 @@ data = pd.read_csv(
         'user_agent': str,
     }
 )
+
 # Enable test mode with limited data if TEST_MODE is True
 if TEST_MODE:
-    data = data.sample(n=100, random_state=RANDOM_STATE)  # Limit data to 100 samples
+    data = data.sample(n=100, random_state=42)  # Limit data to 100 samples
     logger.info("TEST_MODE is ON. Using a limited data subset.")
 
 # Sort by time to preserve chronological order
-data = data.sort_values(by='date', ascending=True)
+data = data.sort_values(by='time')
 
 # Some data transformations from str to labels that are usable
 le = LabelEncoder()
-data['method_encoded'] = le.fit_transform(data['request_method'].fillna('UNKNOWN'))
-data['protocol_encoded'] = le.fit_transform(data['protocol'].fillna('UNKNOWN'))
-data['referrer_encoded'] = le.fit_transform(data['referrer'].fillna('UNKNOWN'))
-data['request_content_type_encoded'] = le.fit_transform(data['request_content_type'].fillna('UNKNOWN'))
-data['user_agent_encoded'] = le.fit_transform(data['user_agent'].fillna('UNKNOWN'))  # Add user_agent encoding
-data['request_uri_encoded'] = le.fit_transform(data['request_uri'].fillna('UNKNOWN'))  # Add user_agent encoding
-data['upstream_response_time_encoded'] = le.fit_transform(data['upstream_response_time'])  # Add user_agent encoding
-
-# Convert the IP address to integers
-data['remote_ip_int'] = data['remote_ip'].apply(lambda ip: int(ip.replace('.', '')))
+data['method_encoded'] = le.transform(data['request_method'])
+data['protocol_encoded'] = le.transform(data['protocol'])
+data['referrer_encoded'] = le.transform(data['referrer'])
+data['request_content_type_encoded'] = le.transform(data['request_content_type'])
+data['remote_ip_int'] =  data['remote_ip'].apply(lambda ip: int(ip.replace('.', '')))
+data['user_agent_encoded'] = le.transform(data['user_agent'])  # Add user_agent encoding
+data['request_uri_encoded'] = le.transform(data['request_uri'])  # Add user_agent encoding
 
 # Drop original columns if no longer needed
-data = data.drop(columns=[
-    'date', #format cannot be used
-    'remote_ip', #transformed to int
-    'request_method', #encoded
-    'protocol', #encoded
-    'referrer', #encoded
-    'user_agent', #encoded
-    'request_uri', #encoded
-    'upstream_response_time', #too much of the same data problematic for training
-    'request_content_type', #encoded
-])
+data = data.drop(columns=['date', 'request_method', 'protocol', 'referrer', 'user_agent', 'request_uri', 'remote_ip', 'request_content_type'])
 
 # Define features and target
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
 x = data[feature_columns].values
 y = data[TARGET_COLUMN].values
-
-#debug
-#print(data[feature_columns].dtypes)
 
 # Convert to sequences using numpy.array() to avoid slow list-to-tensor conversion
 def create_sequences(sequence_x, sequence_y, sequence_length):
@@ -114,11 +96,11 @@ def create_sequences(sequence_x, sequence_y, sequence_length):
     return torch.tensor(sequences, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
 
 # Prepare sequential data
-X_seq, Y_seq = create_sequences(x, y, SEQUENCE_LENGTH)
+X_seq, y_seq = create_sequences(x, y, SEQUENCE_LENGTH)
 
-# Create DataLoader for training data
-train_dataset = TensorDataset(X_seq, Y_seq)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
+# Create DataLoader for validation data
+validation_dataset = TensorDataset(X_seq, y_seq)
+validation_loader = DataLoader(validation_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Define the LSTM model without embeddings
 class LSTMModel(nn.Module):
@@ -140,32 +122,40 @@ class LSTMModel(nn.Module):
 
 # Model initialization
 input_size = X_seq.shape[2]
-model = LSTMModel(input_size, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
+model = LSTMModel(input_size, hidden_size=64, output_size=2, dropout_rate=0.2).to(device)
 
-# Criterion and optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+# Load the pre-trained model if available
+if os.path.exists(MODEL_PATH):
+    model.load_state_dict(torch.load(MODEL_PATH))
+    logger.info("Loaded existing model from disk.")
+else:
+    logger.error("No model found at the specified path.")
+    exit()
 
-# Training loop
-logger.info("Starting training...")
-for epoch in range(EPOCHS):
-    model.train()
-    running_loss = 0.0
-    for X_batch, y_batch in train_loader:
-        y_batch = y_batch.to(torch.long)
-        X_batch = torch.log1p(X_batch)  # brings extreme values back to normal values so the model does not get unstable.
+# Model evaluation
+logger.info("Evaluating the model...")
+model.eval()
+y_pred_list = []
+y_true_list = []
+
+with torch.no_grad():
+    for X_batch, y_batch in validation_loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
         outputs = model(X_batch)
-        loss = criterion(outputs, y_batch)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        running_loss += loss.item()
-    logger.info(f"Epoch {epoch+1}/{EPOCHS}, Loss: {running_loss / len(train_loader):.4f}")
+        _, y_pred = torch.max(outputs, 1)
+        y_pred_list.extend(y_pred.cpu().numpy())
+        y_true_list.extend(y_batch.cpu().numpy())
 
-# Save the model after training
-torch.save(model.state_dict(), MODEL_PATH)
-logger.info(f"Model saved to {MODEL_PATH}")
+# Confusion matrix
+cm = confusion_matrix(y_true_list, y_pred_list)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.show()
+
+# Print classification report for more details
+logger.info("Classification Report:\n" + classification_report(y_true_list, y_pred_list))
 
 logger.info("Script completed successfully.")
