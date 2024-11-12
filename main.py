@@ -1,18 +1,20 @@
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import confusion_matrix, classification_report
-import seaborn as sns
-import matplotlib.pyplot as plt
 import logging
 import os
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.preprocessing import LabelEncoder
+from torch.utils.data import DataLoader, TensorDataset
+
 # Configuration
-TEST_MODE = True  # Toggle for testing with limited data
-DATA_PATH = 'data.csv'  # Path to CSV file
+TEST_MODE = False  # Toggle for testing with limited data
+DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training.csv'  # Path to CSV file
 MODEL_PATH = 'lstm_model.pth'  # Path to save the model
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 TEST_SIZE = 0.2  # Fraction of data to use for testing
@@ -36,8 +38,38 @@ logger.info(f"Using device: {device}")
 
 # Load and preprocess data
 logger.info("Loading data...")
-data = pd.read_csv(DATA_PATH)
-
+data = pd.read_csv(
+    DATA_PATH,
+    quotechar='"',
+    sep=",",
+    encoding='utf-8',
+    low_memory=False,
+    parse_dates=['date'],  # Parse date column
+    dtype={
+        'time': float,
+        'malicious': bool,
+        'remote_ip': str,
+        'remote_port': int,
+        'connection_id': int,
+        'connection_time': float,
+        'upstream_response_time': float,
+        'upstream_response_length': int,
+        'upstream_status': int,
+        'upstream_connection_time': float,
+        'response_body_size': int,
+        'response_total_size': int,
+        'response_status': int,
+        'response_time': float,
+        'requestLength': int,
+        'request_content_length': int,
+        'request_content_type': str,
+        'request_method': str,
+        'request_uri': str,
+        'referrer': str,
+        'protocol': str,
+        'user_agent': str,
+    }
+)
 # Enable test mode with limited data if TEST_MODE is True
 if TEST_MODE:
     data = data.sample(n=100, random_state=RANDOM_STATE)  # Limit data to 100 samples
@@ -46,22 +78,34 @@ if TEST_MODE:
 # Sort by time to preserve chronological order
 data = data.sort_values(by='time')
 
+# Some data transformations from str to labels that are usable
+le = LabelEncoder()
+data['method_encoded'] = le.fit_transform(data['request_method'])
+data['protocol_encoded'] = le.fit_transform(data['protocol'])
+data['referrer_encoded'] = le.fit_transform(data['referrer'])
+data['request_content_type_encoded'] = le.fit_transform(data['request_content_type'])
+data['remote_ip_int'] =  data['remote_ip'].apply(lambda x: int(x.replace('.', '')))
+data['user_agent_encoded'] = le.fit_transform(data['user_agent'])  # Add user_agent encoding
+data['request_uri_encoded'] = le.fit_transform(data['request_uri'])  # Add user_agent encoding
+
+# Drop original columns if no longer needed
+data = data.drop(columns=['date', 'request_method', 'protocol', 'referrer', 'user_agent', 'request_uri', 'remote_ip', 'request_content_type'])
+
 # Define features and target
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
-X = data[feature_columns].values
+x = data[feature_columns].values
 y = data[TARGET_COLUMN].values
 
-# Convert to sequences
-def create_sequences(X, y, sequence_length):
-    sequences = []
-    labels = []
-    for i in range(len(X) - sequence_length + 1):
-        sequences.append(X[i:i + sequence_length])
-        labels.append(y[i + sequence_length - 1])  # Label at the end of the sequence
+print(data[feature_columns].dtypes)
+
+# Convert to sequences using numpy.array() to avoid slow list-to-tensor conversion
+def create_sequences(sequence_x, sequence_y, sequence_length):
+    sequences = np.array([sequence_x[i:i + sequence_length] for i in range(len(sequence_x) - sequence_length + 1)])
+    labels = np.array([sequence_y[i + sequence_length - 1] for i in range(len(sequence_y) - sequence_length + 1)])
     return torch.tensor(sequences, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
 
 # Prepare sequential data
-X_seq, y_seq = create_sequences(X, y, SEQUENCE_LENGTH)
+X_seq, y_seq = create_sequences(x, y, SEQUENCE_LENGTH)
 
 # Split data for training and testing
 split_index = int((1 - TEST_SIZE) * len(X_seq))
@@ -74,23 +118,29 @@ test_dataset = TensorDataset(X_test, y_test)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# Define the LSTM model
+# Define the LSTM model without embeddings
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
+        # LSTM layer
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.dropout = nn.Dropout(dropout_rate)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        _, (hn, _) = self.lstm(x)  # hn is the last hidden state
-        hn = self.dropout(hn[-1])
+        # LSTM forward pass
+        _, (hn, _) = self.lstm(x)  # Get the last hidden state from LSTM
+        hn = self.dropout(hn[-1])  # Apply dropout
+
+        # Fully connected layer
         out = self.fc(hn)
         return out
 
 # Model initialization
 input_size = X_train.shape[2]
 model = LSTMModel(input_size, HIDDEN_SIZE, output_size=2, dropout_rate=DROPOUT_RATE).to(device)
+
+# Criterion and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
