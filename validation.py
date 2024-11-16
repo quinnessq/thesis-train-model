@@ -12,16 +12,15 @@ from sklearn.preprocessing import LabelEncoder
 from transformers import AutoTokenizer
 
 # Configuration
-TEST_MODE = False  # Toggle for testing with limited data
+#VALIDATION_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training-test.csv'
 VALIDATION_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'  # Path to CSV file
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 MODEL_PATH = 'lstm_model.pth'
-BATCH_SIZE = 64
-CHUNK_SIZE = 1000  # Load data in chunks
+BATCH_SIZE = 512
+CHUNK_SIZE = 1024  # Load data in chunks
 HIDDEN_SIZE = 256
 DROPOUT_RATE = 0.2
-RANDOM_STATE = 42
-SEQUENCE_LENGTH = 20
+SEQUENCE_LENGTH = 256
 OUTPUT_SIZE = 2
 
 # Set up logging
@@ -35,73 +34,37 @@ logger.info(f"Using device: {device}")
 # Initialize tokenizer
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-# Updated batch tokenization and padding function to ensure consistent output
 def batch_tokenize_and_pad(data, column_name, max_length=15):
-    # Tokenize the column with error handling for non-string or empty values
+    """ Tokenize and pad a given column of data to max_length """
     encoded_batch = tokenizer(data[column_name].fillna('').astype(str).tolist(),
                               padding='max_length', truncation=True, max_length=max_length,
                               return_tensors="pt")
-    # Convert to list of lists for DataFrame compatibility
     return encoded_batch['input_ids'].numpy().tolist()
 
-# Updated expand_tokens function to handle non-list entries gracefully
 def expand_tokens(data, column_name, num_columns):
-    # Ensure each row has the correct number of tokens, replacing any non-list entries with a placeholder list
+    """ Expand tokens into a fixed number of columns """
     token_data = [
         row if isinstance(row, list) and len(row) == num_columns else [0] * num_columns
         for row in data[column_name]
     ]
-    # Create a DataFrame with the expanded columns
     token_columns = pd.DataFrame(token_data, columns=[f"{column_name}_{i}" for i in range(num_columns)])
-    # Concatenate to the original DataFrame and drop the original token column
     data = pd.concat([data, token_columns], axis=1).drop(columns=[column_name])
     return data
 
-# Process data in chunks
-processed_chunks = []
-chunk_counter = 0  # Initialize chunk counter
-for chunk in pd.read_csv(
-        VALIDATION_DATA_PATH,
-        quotechar='"',
-        sep=",",
-        encoding='utf-8',
-        low_memory=False,
-        parse_dates=['date'],
-        dtype={
-            'time': float,
-            'malicious': bool,
-            'remote_ip': str,
-            'remote_port': int,
-            'connection_id': int,
-            'connection_time': float,
-            'upstream_response_time': float,
-            'upstream_response_length': int,
-            'upstream_status': int,
-            'upstream_connection_time': float,
-            'response_body_size': int,
-            'response_total_size': int,
-            'response_status': int,
-            'response_time': float,
-            'requestLength': int,
-            'request_content_length': int,
-            'request_content_type': str,
-            'request_method': str,
-            'request_uri': str,
-            'referrer': str,
-            'protocol': str,
-            'user_agent': str,
-        },
-        chunksize=CHUNK_SIZE):
+def process_chunk(chunk):
+    """ Process each chunk of data """
+    # Ensure chunk is a copy to avoid SettingWithCopyWarning
+    chunk = chunk.copy()
 
-    # Fill NaNs and convert non-string entries to strings in relevant columns
-    chunk['request_uri'] = chunk['request_uri'].fillna('').astype(str)
-    chunk['user_agent'] = chunk['user_agent'].fillna('').astype(str)
+    # Replace NaNs with empty strings and convert to strings
+    chunk.loc[:, 'request_uri'] = chunk['request_uri'].fillna('').astype(str)
+    chunk.loc[:, 'user_agent'] = chunk['user_agent'].fillna('').astype(str)
 
-    # Tokenize and pad 'request_uri' and 'user_agent'
-    chunk['request_uri_tokens_padded'] = list(batch_tokenize_and_pad(chunk, 'request_uri'))
-    chunk['user_agent_tokens_padded'] = list(batch_tokenize_and_pad(chunk, 'user_agent'))
+    # Tokenization and padding
+    chunk['request_uri_tokens_padded'] = batch_tokenize_and_pad(chunk, 'request_uri')
+    chunk['user_agent_tokens_padded'] = batch_tokenize_and_pad(chunk, 'user_agent')
 
-    # Expand token columns to fixed length
+    # Expanding tokens into fixed number of columns
     chunk = expand_tokens(chunk, 'request_uri_tokens_padded', 15)
     chunk = expand_tokens(chunk, 'user_agent_tokens_padded', 15)
 
@@ -112,56 +75,68 @@ for chunk in pd.read_csv(
     chunk['referrer_encoded'] = le.fit_transform(chunk['referrer'].fillna('UNKNOWN'))
     chunk['request_content_type_encoded'] = le.fit_transform(chunk['request_content_type'].fillna('UNKNOWN'))
 
-    # Convert IP address to integers
+    # Convert IP addresses and handle missing values
     chunk['remote_ip_int'] = chunk['remote_ip'].apply(lambda ip: int(ip.replace('.', '')) if pd.notna(ip) else 0)
-    chunk['remote_port'] = chunk['remote_port'].fillna(-1)
-    chunk['connection_id'] = chunk['connection_id'].fillna(-1)
-    chunk['upstream_status'] = chunk['upstream_status'].fillna(-1)
-    chunk['response_body_size'] = chunk['response_body_size'].fillna(-1)
-    chunk['upstream_response_length'] = chunk['upstream_response_length'].fillna(-1)
-    chunk['response_total_size'] = chunk['response_total_size'].fillna(-1)
-    chunk['response_status'] = chunk['response_status'].fillna(-1)
-    chunk['requestLength'] = chunk['requestLength'].fillna(-1)
-    chunk['request_content_length'] = chunk['request_content_length'].fillna(-1)
+    chunk.fillna({
+        'remote_port': -1,
+        'connection_id': -1,
+        'upstream_status': -1,
+        'response_body_size': -1,
+        'upstream_response_length': -1,
+        'response_total_size': -1,
+        'response_status': -1,
+        'requestLength': -1,
+        'request_content_length': -1
+    }, inplace=True)
 
     # Drop original columns
-    chunk = chunk.drop(columns=[
-        'date', 'remote_ip', 'request_method', 'protocol', 'referrer',
-        'user_agent', 'request_uri', 'upstream_response_time', 'request_content_type',
-    ])
+    chunk.drop(columns=['date', 'remote_ip', 'request_method', 'protocol', 'referrer', 'user_agent', 'request_uri',
+                        'upstream_response_time', 'request_content_type'], inplace=True)
 
-    # Append processed chunk to list
-    processed_chunks.append(chunk)
-    # Increment and log chunk count
+    return chunk
+
+# Load and sort the entire dataset before chunking
+logger.info("Loading and sorting the dataset...")
+data = pd.read_csv(TRAINING_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
+
+# Sort by connection_id and time to ensure the data is in correct order
+data.sort_values(by=['connection_id', 'time'], inplace=True)
+
+# Now process the data in chunks
+processed_chunks = []
+chunk_counter = 0  # Initialize chunk counter
+for start_row in range(0, len(data), CHUNK_SIZE):
+    # Create a chunk
+    chunk = data.iloc[start_row:start_row+CHUNK_SIZE]
+
+    # Process the chunk
+    processed_chunks.append(process_chunk(chunk))
     chunk_counter += 1
-    logger.info(f"Processed chunk {chunk_counter}")
+    if chunk_counter % 100 == 0:  # Log every 100 chunks
+        logger.info(f"Processed chunk {chunk_counter}")
 
 # Concatenate all processed chunks
 data = pd.concat(processed_chunks, ignore_index=True)
-logger.info(f"Total chunks processed: {chunk_counter}")
+
+logger.info("Data processing complete.")
+
 
 # Define features and target
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
 x = data[feature_columns].values
 y = data[TARGET_COLUMN].values
 
-# Batch sequence creation
 def create_sequences_batch(sequence_x, sequence_y, sequence_length, batch_size):
-    """
-    Generates sequences in batches to avoid memory overflow.
-    """
+    """ Generate sequences in batches to avoid memory overflow """
     num_batches = len(sequence_x) // batch_size
     remainder = len(sequence_x) % batch_size
-
     for i in range(num_batches + (1 if remainder > 0 else 0)):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, len(sequence_x))
 
-        # Create sequences for the current batch
         batch_x = sequence_x[start_idx:end_idx]
         batch_y = sequence_y[start_idx:end_idx]
 
-        # If the batch is too small to form a sequence, skip it
         if len(batch_x) < sequence_length:
             continue
 
@@ -169,89 +144,78 @@ def create_sequences_batch(sequence_x, sequence_y, sequence_length, batch_size):
         sequences = np.array([batch_x[j:j + sequence_length] for j in range(len(batch_x) - sequence_length + 1)])
         labels = np.array([batch_y[j + sequence_length - 1] for j in range(len(batch_y) - sequence_length + 1)])
 
-        yield torch.tensor(sequences, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
+        sequences = torch.stack([torch.tensor(seq, dtype=torch.float32) for seq in sequences])
+        labels = torch.tensor(labels, dtype=torch.long)
 
-# Create DataLoader for training data using the generator
+        yield sequences, labels
+
 def data_generator():
+    """ Generator function to yield batches of data """
     for X_batch, Y_batch in create_sequences_batch(x, y, SEQUENCE_LENGTH, BATCH_SIZE):
-
-        # Ensure X_batch contains valid numbers before logging and transforming
-        #print(f"Original unique values in Y_batch: {torch.unique(Y_batch)}")
-        #print(f"Original unique values in X_batch: {torch.unique(X_batch)}")
-
-        # Clean X_batch by handling NaN, positive infinity, and negative infinity
         X_batch = torch.nan_to_num(X_batch, nan=0.0, posinf=1e10, neginf=-1e10)
+        X_batch = torch.clamp(X_batch, min=0.0)
+        X_batch = torch.log1p(X_batch).to(device)
 
-        # Check if there are still any NaN or infinite values
-        if torch.any(torch.isnan(X_batch)) or torch.any(torch.isinf(X_batch)):
-            print("Warning: X_batch contains NaN or Inf values after cleaning")
-            X_batch = torch.nan_to_num(X_batch, nan=0.0, posinf=1e10, neginf=-1e10)
-
-        # Print unique values after cleaning X_batch
-        #print(f"Unique values in cleaned X_batch: {torch.unique(X_batch)}")
-
-        # Ensure that X_batch doesn't contain negative values before applying log1p
-        X_batch = torch.clamp(X_batch, min=0.0)  # Clip values to >= 0
-
-        # Apply log1p to avoid instability due to large values
-        X_batch = torch.log1p(X_batch).to(device)  # Apply log1p and send to device
-
-        # Clean Y_batch to ensure no invalid values
-        invalid_label_value = -9223372036854775808  # Invalid label (int64 min value)
-        valid_class_range = 10  # Assuming 10 classes, adjust based on your specific task
-
-        # Replace invalid labels in Y_batch with a valid class (e.g., 0)
-        Y_batch = torch.where(Y_batch == invalid_label_value, torch.zeros_like(Y_batch), Y_batch)
-
-        # Ensure Y_batch values are within the valid range [0, n_classes)
-        Y_batch = torch.clamp(Y_batch, min=0, max=valid_class_range - 1)
-
-        # Check for any invalid Y_batch values
-        if torch.any(Y_batch < 0) or torch.any(Y_batch >= valid_class_range):
-            print(f"Warning: Y_batch contains invalid values: {torch.unique(Y_batch)}")
-
-        # Ensure Y_batch is transferred to the device
-        Y_batch = Y_batch.to(device)
-
-        # Print unique values of Y_batch after cleaning
-        #print(f"Unique values in cleaned Y_batch: {torch.unique(Y_batch)}")
-
-        # Yield the batch
+        # Clean labels and ensure they're within valid class range
+        Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)
         yield X_batch, Y_batch
-
-
 
 # Define the LSTM model
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=3, batch_first=True, dropout=dropout_rate)
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, output_size)
+
+        # LSTM layer (bidirectional)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=4, bidirectional=True, batch_first=True, dropout=dropout_rate)
+
+        # Attention layer
+        self.attention = nn.Linear(hidden_size * 2, 1)  # attention weight for each timestep in LSTM
+
+        # Fully connected layers (MLP)
+        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
+        self.fc3 = nn.Linear(hidden_size // 2, output_size)
+
+        # Dropout layer for regularization
         self.dropout = nn.Dropout(dropout_rate)
+
+        # ReLU activation
         self.relu = nn.ReLU()
 
+        # Layer normalization (after dropout and activation)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
     def forward(self, x):
-        _, (hn, _) = self.lstm(x)
-        hn = self.dropout(hn[-1])  # Take the output from the last LSTM layer
-        out = self.fc1(hn)
+        # Get LSTM outputs
+        lstm_out, _ = self.lstm(x)
+
+        # Compute attention weights and apply them to the LSTM output
+        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)  # attention weights over timesteps
+        context = torch.sum(attn_weights * lstm_out, dim=1)  # weighted sum of LSTM output
+
+        # Fully connected layers with ReLU activations and dropout
+        out = self.fc1(context)
         out = self.relu(out)
+        out = self.layer_norm(out)  # Layer normalization
         out = self.dropout(out)
+
         out = self.fc2(out)
         out = self.relu(out)
         out = self.dropout(out)
-        out = self.fc3(out)
+
+        out = self.fc3(out)  # Final output (raw logits, no activation)
+
         return out
 
 # Model initialization
 input_size = len(feature_columns)
 logger.info(f"Feature column size: {input_size}")
-model = LSTMModel(input_size, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
+# Model initialization
+model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
 
 # Load the pre-trained model if available
 if os.path.exists(MODEL_PATH):
-    model.load_state_dict(torch.load(MODEL_PATH))
+    model.load_state_dict(torch.load(MODEL_PATH), strict=False)
     logger.info("Loaded existing model from disk.")
 else:
     logger.error("No model found at the specified path.")
@@ -259,22 +223,43 @@ else:
 
 # Model evaluation
 logger.info("Evaluating the model...")
+
+# Initialize the loss function once
+criterion = nn.CrossEntropyLoss()
+
 model.eval()
 y_pred_list = []
 y_true_list = []
 
+# Disable gradient computation for validation
 with torch.no_grad():
     for X_batch, y_batch in data_generator():
+        # Move data to the correct device (GPU or CPU)
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        # Get model predictions
         outputs = model(X_batch)
+
+        # Compute loss (optional)
+        loss = criterion(outputs, y_batch)
+
+        # Log the loss value for monitoring
+        logger.info(f"Validation Loss: {loss.item()}")
+
+        # Get predicted class labels
         _, y_pred = torch.max(outputs, 1)
+
+        # Collect predictions and true labels for metrics
         y_pred_list.extend(y_pred.cpu().numpy())
         y_true_list.extend(y_batch.cpu().numpy())
 
-# Confusion matrix
+# Generate confusion matrix
 cm = confusion_matrix(y_true_list, y_pred_list)
+
+# Plot confusion matrix
+labels = ['Class 0', 'Class 1']  # Adjust these according to your target classes
 plt.figure(figsize=(8, 6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
 plt.xlabel('Predicted')
 plt.ylabel('Actual')
 plt.title('Confusion Matrix')
