@@ -1,4 +1,5 @@
 import logging
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -9,9 +10,10 @@ from transformers import AutoTokenizer
 
 # Configuration
 TEST_MODE = False
-TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training-test.csv'
-#TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training.csv'
+#TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training-test.csv'
+TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training.csv'
 #TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'
+PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_training.pkl'  # Path for processed data
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
 BATCH_SIZE = 512
@@ -97,31 +99,38 @@ def process_chunk(chunk):
 
     return chunk
 
-# Load and sort the entire dataset before chunking
-logger.info("Loading and sorting the dataset...")
-data = pd.read_csv(TRAINING_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
+# Check if processed data exists and load it, otherwise process raw data
+if os.path.exists(PROCESSED_DATA_PATH):
+    logger.info("Loading processed data from file...")
+    data = pd.read_pickle(PROCESSED_DATA_PATH)
+else:
+    logger.info("Loading and sorting the dataset...")
+    data = pd.read_csv(TRAINING_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
 
-# Sort by connection_id and time to ensure the data is in correct order
-data.sort_values(by=['connection_id', 'time'], inplace=True)
+    # Sort by connection_id and time to ensure the data is in correct order
+    data.sort_values(by=['connection_id', 'time'], inplace=True)
 
-# Now process the data in chunks
-processed_chunks = []
-chunk_counter = 0  # Initialize chunk counter
-for start_row in range(0, len(data), CHUNK_SIZE):
-    # Create a chunk
-    chunk = data.iloc[start_row:start_row+CHUNK_SIZE]
+    # Now process the data in chunks
+    processed_chunks = []
+    chunk_counter = 0  # Initialize chunk counter
+    for start_row in range(0, len(data), CHUNK_SIZE):
+        # Create a chunk
+        chunk = data.iloc[start_row:start_row+CHUNK_SIZE]
 
-    # Process the chunk
-    processed_chunks.append(process_chunk(chunk))
-    chunk_counter += 1
-    if chunk_counter % 100 == 0:  # Log every 100 chunks
-        logger.info(f"Processed chunk {chunk_counter}")
+        # Process the chunk
+        processed_chunks.append(process_chunk(chunk))
+        chunk_counter += 1
+        if chunk_counter % 100 == 0:  # Log every 100 chunks
+            logger.info(f"Processed chunk {chunk_counter}")
 
-# Concatenate all processed chunks
-data = pd.concat(processed_chunks, ignore_index=True)
+    # Concatenate all processed chunks
+    data = pd.concat(processed_chunks, ignore_index=True)
+
+    # Save processed data for future use
+    logger.info(f"Saving processed data to {PROCESSED_DATA_PATH}...")
+    data.to_pickle(PROCESSED_DATA_PATH)
 
 logger.info("Data processing complete.")
-
 
 # Define features and target
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
@@ -170,8 +179,8 @@ class LSTMModel(nn.Module):
         # LSTM layer (bidirectional)
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=4, bidirectional=True, batch_first=True, dropout=dropout_rate)
 
-        # Attention layer
-        self.attention = nn.Linear(hidden_size * 2, 1)  # attention weight for each timestep in LSTM
+        # Transformer-based multi-head attention
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size * 2, num_heads=4, dropout=dropout_rate)
 
         # Fully connected layers (MLP)
         self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
@@ -191,9 +200,18 @@ class LSTMModel(nn.Module):
         # Get LSTM outputs
         lstm_out, _ = self.lstm(x)
 
-        # Compute attention weights and apply them to the LSTM output
-        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)  # attention weights over timesteps
-        context = torch.sum(attn_weights * lstm_out, dim=1)  # weighted sum of LSTM output
+        # Transformer-based attention
+        # We need to reshape the LSTM output for multihead attention (batch, seq_len, hidden_size*2) -> (seq_len, batch, hidden_size*2)
+        lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size*2) -> (seq_len, batch, hidden_size*2)
+
+        # Pass through multihead attention layer
+        attn_output, _ = self.attention(lstm_out_transpose, lstm_out_transpose, lstm_out_transpose)
+
+        # The output is the weighted sum of the input sequence, now we revert the permutation
+        attn_output = attn_output.permute(1, 0, 2)  # (seq_len, batch, hidden_size*2) -> (batch, seq_len, hidden_size*2)
+
+        # Use the last time step's output for classification
+        context = attn_output[:, -1, :]  # Take the output at the last timestep
 
         # Fully connected layers with ReLU activations and dropout
         out = self.fc1(context)
@@ -205,7 +223,7 @@ class LSTMModel(nn.Module):
         out = self.relu(out)
         out = self.dropout(out)
 
-        out = self.fc3(out)  # Final output (raw logits, no activation)
+        out = self.fc3(out)  # Final output (raw logits)
 
         return out
 
@@ -240,4 +258,3 @@ for epoch in range(EPOCHS):
 # Save the model
 torch.save(model.state_dict(), MODEL_PATH)
 logger.info(f"Model saved to {MODEL_PATH}")
-
