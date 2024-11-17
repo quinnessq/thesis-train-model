@@ -8,18 +8,14 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.preprocessing import LabelEncoder
-from transformers import AutoTokenizer
 
 # Configuration
-#VALIDATION_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training-test.csv'
 VALIDATION_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'  # Path to CSV file
-PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_validation.pkl'  # Path for processed data
+PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_validation.pkl'  # Path for processed data
 
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 MODEL_PATH = 'lstm_model.pth'
 BATCH_SIZE = 128
-CHUNK_SIZE = 512
 HIDDEN_SIZE = 64
 SEQUENCE_LENGTH = 64
 DROPOUT_RATE = 0.2
@@ -33,131 +29,9 @@ logger = logging.getLogger(__name__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"Using device: {device}")
 
-# Initialize tokenizer
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-def batch_tokenize_and_pad(data, column_name, max_length=15):
-    """ Tokenize and pad a given column of data to max_length """
-    encoded_batch = tokenizer(data[column_name].fillna('').astype(str).tolist(),
-                              padding='max_length', truncation=True, max_length=max_length,
-                              return_tensors="pt")
-    return encoded_batch['input_ids'].numpy().tolist()
-
-def expand_tokens(data, column_name, num_columns):
-    """ Expand tokens into a fixed number of columns """
-    token_data = [
-        row if isinstance(row, list) and len(row) == num_columns else [0] * num_columns
-        for row in data[column_name]
-    ]
-    token_columns = pd.DataFrame(token_data, columns=[f"{column_name}_{i}" for i in range(num_columns)])
-    data = pd.concat([data, token_columns], axis=1).drop(columns=[column_name])
-    return data
-
-def aggregate_connection_features(data):
-    """ Aggregate features for each connection_id """
-
-    # Aggregate features
-    aggregated_features = data.groupby('connection_id').agg(
-        num_requests=('request_uri', 'count'),
-        avg_response_time=('response_time', 'mean'),
-        max_response_time=('response_time', 'max'),
-        count_slow_requests=('response_time', lambda x: (x > 0.75).sum()),  # Slow requests > 0.75s
-        avg_time_between_requests=('time_diff', 'mean'),  # Average time between requests
-        session_duration=('session_duration', 'mean'),  # Duration of session (mean)
-        total_response_size=('response_body_size', 'sum'),
-        avg_response_size=('response_body_size', 'mean'),
-        unique_uris=('request_uri', 'nunique'),  # Count unique request URIs
-    ).reset_index()
-
-    # Now calculate request_frequency as requests per unit time (e.g., per second)
-    aggregated_features['request_frequency'] = aggregated_features['num_requests'] / aggregated_features['session_duration']
-
-    return aggregated_features
-
-def process_chunk(chunk):
-    """ Process each chunk of data """
-    # Ensure chunk is a copy to avoid SettingWithCopyWarning
-    chunk = chunk.copy()
-
-    # Replace NaNs with empty strings and convert to strings using .loc
-    chunk.loc[:, 'request_uri'] = chunk['request_uri'].fillna('').astype(str)
-    chunk.loc[:, 'user_agent'] = chunk['user_agent'].fillna('').astype(str)
-
-    # Tokenization and padding
-    chunk['request_uri_tokens_padded'] = batch_tokenize_and_pad(chunk, 'request_uri')
-    chunk['user_agent_tokens_padded'] = batch_tokenize_and_pad(chunk, 'user_agent')
-
-    # Expanding tokens into fixed number of columns
-    chunk = expand_tokens(chunk, 'request_uri_tokens_padded', 15)
-    chunk = expand_tokens(chunk, 'user_agent_tokens_padded', 15)
-
-    # Encode categorical features
-    le = LabelEncoder()
-    chunk.loc[:, 'method_encoded'] = le.fit_transform(chunk['request_method'].fillna('UNKNOWN'))
-    chunk.loc[:, 'protocol_encoded'] = le.fit_transform(chunk['protocol'].fillna('UNKNOWN'))
-    chunk.loc[:, 'referrer_encoded'] = le.fit_transform(chunk['referrer'].fillna('UNKNOWN'))
-    chunk.loc[:, 'request_content_type_encoded'] = le.fit_transform(chunk['request_content_type'].fillna('UNKNOWN'))
-
-    # Convert IP addresses and handle missing values
-    chunk.loc[:, 'remote_ip_int'] = chunk['remote_ip'].apply(lambda ip: int(ip.replace('.', '')) if pd.notna(ip) else 0)
-    chunk.fillna({
-        'remote_port': -1,
-        'connection_id': -1,
-        'upstream_status': -1,
-        'response_body_size': -1,
-        'upstream_response_length': -1,
-        'response_total_size': -1,
-        'response_status': -1,
-        'requestLength': -1,
-        'request_content_length': -1
-    }, inplace=True)
-
-    # Create aggregated connection features
-    aggregated_features = aggregate_connection_features(chunk)
-    chunk = chunk.merge(aggregated_features, on='connection_id', how='left')
-
-    # Drop original columns we don't need anymore
-    chunk.drop(columns=['date', 'remote_ip', 'request_method', 'protocol', 'referrer', 'user_agent', 'request_uri',
-                        'upstream_response_time', 'request_content_type'], inplace=True)
-
-    return chunk
-
 # Check if processed data exists and load it, otherwise process raw data
-if os.path.exists(PROCESSED_DATA_PATH):
-    logger.info("Loading processed data from file...")
-    data = pd.read_pickle(PROCESSED_DATA_PATH)
-else:
-    logger.info("Loading and sorting the dataset...")
-    data = pd.read_csv(VALIDATION_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
-
-    # Sort by connection_id and time to ensure the data is in correct order
-    data.sort_values(by=['connection_id', 'time'], inplace=True)
-
-    # Calculate time difference between requests for each connection_id (in seconds)
-    data['time_diff'] = data.groupby('connection_id')['time'].diff()
-
-    # Calculate session duration for each connection_id (in seconds)
-    data['session_duration'] = data.groupby('connection_id')['time'].transform(lambda x: x.max() - x.min())
-
-    # Process the data in chunks
-    processed_chunks = []
-    chunk_counter = 0  # Initialize chunk counter
-    for start_row in range(0, len(data), CHUNK_SIZE):
-        # Create a chunk
-        chunk = data.iloc[start_row:start_row+CHUNK_SIZE]
-
-        # Process the chunk
-        processed_chunks.append(process_chunk(chunk))
-        chunk_counter += 1
-        if chunk_counter % 100 == 0:  # Log every 100 chunks
-            logger.info(f"Processed chunk {chunk_counter}")
-
-    # Concatenate all processed chunks
-    data = pd.concat(processed_chunks, ignore_index=True)
-
-    # Save processed data for future use
-    logger.info(f"Saving processed data to {PROCESSED_DATA_PATH}...")
-    data.to_pickle(PROCESSED_DATA_PATH)
+logger.info("Loading processed data from file...")
+data = pd.read_pickle(PROCESSED_DATA_VALIDATION_PATH)
 
 logger.info("Data processing complete.")
 

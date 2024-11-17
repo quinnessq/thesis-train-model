@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils import compute_class_weight
 from transformers import AutoTokenizer
 
 # Configuration
@@ -22,15 +23,19 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
 BATCH_SIZE = 128
-CHUNK_SIZE = 512
 HIDDEN_SIZE = 64
 SEQUENCE_LENGTH = 64
 
+CHUNK_SIZE = 2000
 EPOCHS = 10 if not TEST_MODE else 2
 LEARNING_RATE = 0.00001
 WEIGHT_DECAY = 0.02
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
+
+pd.set_option('display.max_columns', None)  # Show all columns
+pd.set_option('display.max_rows', None)     # Show all rows (if necessary)
+pd.set_option('display.width', None)        # No line width limit for displaying columns
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -52,12 +57,42 @@ def batch_tokenize_and_pad(data, column_name, max_length=15):
 
 def expand_tokens(data, column_name, num_columns):
     """ Expand tokens into a fixed number of columns """
+
+    #print(f"DataFrame has {len(data)} rows and {data.shape[1]} columns before token expansion.")
+
+    # Tokenize each entry and ensure it's a list of exact length `num_columns`
     token_data = [
-        row if isinstance(row, list) and len(row) == num_columns else [0] * num_columns
-        for row in data[column_name]
+        (row if isinstance(row, list) and len(row) == num_columns
+         else [0] * num_columns)  # Pad with zeros if row is not a valid list or doesn't match `num_columns`
+        for row in data[column_name].fillna('')  # Ensure NaNs are handled by filling with empty string
     ]
-    token_columns = pd.DataFrame(token_data, columns=[f"{column_name}_{i}" for i in range(num_columns)])
+
+    # Create new column names and check for conflicts
+    new_column_names = [f"{column_name}_{i}" for i in range(num_columns)]
+
+    # If any of the new column names already exist, we append a suffix to make them unique
+    existing_columns = set(data.columns)
+    for i, new_col in enumerate(new_column_names):
+        if new_col in existing_columns:
+            new_column_names[i] = f"{new_col}_new"
+
+    # Create the token columns DataFrame
+    token_columns = pd.DataFrame(token_data, columns=new_column_names)
+
+    # Check for the number of rows before concatenation
+    #print(f"DataFrame before concat has {len(data)} rows and {data.shape[1]} columns.")
+    #print(f"Token columns has {len(token_columns)} rows and {token_columns.shape[1]} columns.")
+
+    # Reset index for both data and token_columns to align rows properly during concatenation
+    data.reset_index(drop=True, inplace=True)
+    token_columns.reset_index(drop=True, inplace=True)
+
+    # Concatenate the new token columns and drop the original column
     data = pd.concat([data, token_columns], axis=1).drop(columns=[column_name])
+
+    # Print the shape after concatenation
+    #print(f"DataFrame after concat has {len(data)} rows and {data.shape[1]} columns.")
+
     return data
 
 def aggregate_connection_features(data):
@@ -85,6 +120,8 @@ def process_chunk(chunk):
     """ Process each chunk of data """
     # Ensure chunk is a copy to avoid SettingWithCopyWarning
     chunk = chunk.copy()
+    unique_values = np.unique(chunk[TARGET_COLUMN])
+    print(f"Received chunk contains entries: {unique_values}")
 
     # Replace NaNs with empty strings and convert to strings using .loc
     chunk.loc[:, 'request_uri'] = chunk['request_uri'].fillna('').astype(str)
@@ -121,11 +158,15 @@ def process_chunk(chunk):
 
     # Create aggregated connection features
     aggregated_features = aggregate_connection_features(chunk)
+
     chunk = chunk.merge(aggregated_features, on='connection_id', how='left')
 
     # Drop original columns we don't need anymore
     chunk.drop(columns=['date', 'remote_ip', 'request_method', 'protocol', 'referrer', 'user_agent', 'request_uri',
                         'upstream_response_time', 'request_content_type'], inplace=True)
+
+    unique_values = np.unique(chunk[TARGET_COLUMN])
+    print(f"After processing chunk contains entries: {unique_values}")
 
     return chunk
 
@@ -136,6 +177,11 @@ if os.path.exists(PROCESSED_DATA_PATH):
 else:
     logger.info("Loading and sorting the dataset...")
     data = pd.read_csv(TRAINING_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
+
+    logger.info(f"Data type of 'malicious' before conversion: {data['malicious'].dtype}")
+    data[TARGET_COLUMN] = data[TARGET_COLUMN].astype('int')  # Convert to integer
+    logger.info(f"Data type of 'malicious' after conversion: {data['malicious'].dtype}")
+    print(f"After changing data type for all data: {np.unique(data[TARGET_COLUMN])}")
 
     # Sort by connection_id and time to ensure the data is in correct order
     data.sort_values(by=['connection_id', 'time'], inplace=True)
@@ -149,14 +195,34 @@ else:
     # Process the data in chunks
     processed_chunks = []
     chunk_counter = 0  # Initialize chunk counter
+    previous_chunk = None
     for start_row in range(0, len(data), CHUNK_SIZE):
-        # Create a chunk
-        chunk = data.iloc[start_row:start_row+CHUNK_SIZE]
+        # Ensure we do not exceed the bounds of the DataFrame
+        end_row = min(start_row + CHUNK_SIZE, len(data))
+        chunk = data.iloc[start_row:end_row]
+
+        # Print unique values of the target column for the current chunk
+        unique_values = np.unique(chunk[TARGET_COLUMN])
+        if 1 in unique_values:
+            print(f"Chunk {chunk_counter} contains malicious entries (1): {unique_values}")
+
+        # If this is not the first chunk, compare it with the previous one
+        if previous_chunk is not None:
+            # Compare entire chunks (rows) between the current and previous chunks
+            if chunk.equals(previous_chunk):
+                logger.warning(f"Chunk {chunk_counter} has identical rows as the previous chunk.")
+            else:
+                logger.info(f"Chunk {chunk_counter} has different rows compared to the previous chunk.")
+
+        # Save the current chunk for comparison in the next iteration
+        previous_chunk = chunk.copy()
 
         # Process the chunk
         processed_chunks.append(process_chunk(chunk))
         chunk_counter += 1
-        if chunk_counter % 100 == 0:  # Log every 100 chunks
+
+        # Log every 100 chunks
+        if chunk_counter % 100 == 0:
             logger.info(f"Processed chunk {chunk_counter}")
 
     # Concatenate all processed chunks
@@ -166,7 +232,10 @@ else:
     logger.info(f"Saving processed data to {PROCESSED_DATA_PATH}...")
     data.to_pickle(PROCESSED_DATA_PATH)
 
+
+print(f"Data after processing chunks contains: {np.unique(data[TARGET_COLUMN])}")
 # Define features and target
+logger.info(f"Data types of columns in the dataset:\n{data.dtypes}")
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
 x = data[feature_columns].values
 y = data[TARGET_COLUMN].values
@@ -197,12 +266,13 @@ def create_sequences_batch(sequence_x, sequence_y, sequence_length, batch_size):
 def data_generator():
     """ Generator function to yield batches of data """
     for X_batch, Y_batch in create_sequences_batch(x, y, SEQUENCE_LENGTH, BATCH_SIZE):
+        # Ensure input data is on the correct device
         X_batch = torch.nan_to_num(X_batch, nan=0.0, posinf=1e10, neginf=-1e10)
         X_batch = torch.clamp(X_batch, min=0.0)
-        X_batch = torch.log1p(X_batch).to(device)
+        X_batch = torch.log1p(X_batch).to(device)  # Move input data to device
 
-        # Clean labels and ensure they're within valid class range
-        Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)
+        # Ensure labels are on the correct device
+        Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)  # Move labels to device
         yield X_batch, Y_batch
 
 def process_validation_data():
@@ -210,6 +280,11 @@ def process_validation_data():
     # Load validation data
     logger.info("Loading validation data...")
     data = pd.read_csv(VALIDATION_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
+
+    logger.info(f"Data type of 'malicious' before conversion: {data['malicious'].dtype}")
+    data[TARGET_COLUMN] = data[TARGET_COLUMN].astype('int')  # Convert to integer
+    logger.info(f"Data type of 'malicious' after conversion: {data['malicious'].dtype}")
+    print(f"After changing data type for all data: {np.unique(data[TARGET_COLUMN])}")
 
     # Sort by connection_id and time to ensure the data is in correct order
     data.sort_values(by=['connection_id', 'time'], inplace=True)
@@ -223,19 +298,46 @@ def process_validation_data():
     # Process the data in chunks
     processed_chunks = []
     chunk_counter = 0
+    # Initialize the previous chunk for comparison
+    previous_chunk = None
+
     for start_row in range(0, len(data), CHUNK_SIZE):
-        chunk = data.iloc[start_row:start_row + CHUNK_SIZE]
+        # Ensure we do not exceed the bounds of the DataFrame
+        end_row = min(start_row + CHUNK_SIZE, len(data))
+        chunk = data.iloc[start_row:end_row]
+
+        # Print unique values of the target column for the current chunk
+        unique_values = np.unique(chunk[TARGET_COLUMN])
+        if 1 in unique_values:
+            print(f"Chunk {chunk_counter} contains malicious entries (1): {unique_values}")
+
+        # If this is not the first chunk, compare it with the previous one
+        if previous_chunk is not None:
+            # Compare entire chunks (rows) between the current and previous chunks
+            if chunk.equals(previous_chunk):
+                logger.warning(f"Chunk {chunk_counter} has identical rows as the previous chunk.")
+            else:
+                logger.info(f"Chunk {chunk_counter} has different rows compared to the previous chunk.")
+
+        # Save the current chunk for comparison in the next iteration
+        previous_chunk = chunk.copy()
+
+        # Process the chunk
         processed_chunks.append(process_chunk(chunk))
         chunk_counter += 1
-        if chunk_counter % 100 == 0:  # Log every 100 chunks
+
+        # Log every 100 chunks
+        if chunk_counter % 100 == 0:
             logger.info(f"Processed chunk {chunk_counter}")
 
     # Concatenate processed chunks
     data = pd.concat(processed_chunks, ignore_index=True)
 
+    print(f"Data after processing chunks contains: {np.unique(data[TARGET_COLUMN])}")
+
     # Save processed data
-    logger.info(f"Saving processed validation data to {PROCESSED_DATA_PATH}...")
-    data.to_pickle(PROCESSED_DATA_PATH)
+    logger.info(f"Saving processed validation data to {PROCESSED_DATA_VALIDATION_PATH}...")
+    data.to_pickle(PROCESSED_DATA_VALIDATION_PATH)
 
     logger.info("Validation data processing complete.")
     return data
@@ -256,12 +358,13 @@ validation_y = validation_data[TARGET_COLUMN].values
 def validation_data_generator():
     """ Generator function for validation data in batches """
     for X_batch, Y_batch in create_sequences_batch(validation_x, validation_y, SEQUENCE_LENGTH, BATCH_SIZE):
+        # Move to device
         X_batch = torch.nan_to_num(X_batch, nan=0.0, posinf=1e10, neginf=-1e10)
         X_batch = torch.clamp(X_batch, min=0.0)
-        X_batch = torch.log1p(X_batch).to(device)
+        X_batch = torch.log1p(X_batch).to(device)  # Ensure data is on the correct device
 
         # Clean labels and ensure they're within valid class range
-        Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)
+        Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)  # Ensure labels are on the correct device
         yield X_batch, Y_batch
 
 logger.info("Data processing complete.")
@@ -325,8 +428,33 @@ class LSTMModel(nn.Module):
 model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
 
 # Criterion and optimizer
-class_weights = torch.tensor([1.0, 10.0])  # Heavier penalty for class 1
-criterion = nn.CrossEntropyLoss(weight=class_weights)
+print(np.unique(y))  # This should print valid class labels, e.g., [0, 1] for binary classification
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, weight=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, input, target):
+        ce_loss = nn.CrossEntropyLoss(weight=self.weight, reduction='none')(input, target)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=class_weights)
+
+# Use the computed class weights in your loss function
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
 
@@ -334,6 +462,9 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patienc
 early_stopping_patience = 2  # Stop after 5 epochs without improvement
 best_val_loss = float('inf')  # Initialize to a very high value
 epochs_without_improvement = 0
+
+for name, param in model.named_parameters():
+    print(f"Parameter {name} is on device {param.device}")
 
 logger.info("Start training model...")
 
@@ -349,7 +480,7 @@ for epoch in range(EPOCHS):
         outputs = model(X_batch)
         loss = criterion(outputs, y_batch)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         running_loss += loss.item()
         batch_counter += 1
@@ -365,8 +496,9 @@ for epoch in range(EPOCHS):
     val_counter = 0
     with torch.no_grad():
         for X_batch_val, y_batch_val in validation_data_generator():
-            outputs_val = model(X_batch_val)
-            loss_val = criterion(outputs_val, y_batch_val)
+            # Ensure validation data is on the correct device
+            outputs_val = model(X_batch_val)  # Model output
+            loss_val = criterion(outputs_val, y_batch_val)  # Compute validation loss on the correct device
             val_loss += loss_val.item()
             val_counter += 1
 
