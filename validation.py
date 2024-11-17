@@ -19,10 +19,10 @@ PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingd
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 MODEL_PATH = 'lstm_model.pth'
 BATCH_SIZE = 128
-CHUNK_SIZE = 512  # Load data in chunks
+CHUNK_SIZE = 512
 HIDDEN_SIZE = 64
-DROPOUT_RATE = 0.2
 SEQUENCE_LENGTH = 64
+DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
 
 # Set up logging
@@ -292,7 +292,7 @@ with torch.no_grad():
         loss = criterion(outputs, y_batch)
 
         # Log the loss value for monitoring
-        logger.info(f"Validation Loss: {loss.item()}")
+        #logger.info(f"Validation Loss: {loss.item()}")
 
         # Get predicted class labels
         _, y_pred = torch.max(outputs, 1)

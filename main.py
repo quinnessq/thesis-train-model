@@ -15,16 +15,21 @@ TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingda
 #TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'
 PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_training.pkl'  # Path for processed data
 #PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_training_test.pkl'  # Path for processed data
+
+VALIDATION_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'  # Path to CSV file
+PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_validation.pkl'  # Path for processed data
+
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
 BATCH_SIZE = 128
 CHUNK_SIZE = 512
+HIDDEN_SIZE = 64
+SEQUENCE_LENGTH = 64
+
 EPOCHS = 10 if not TEST_MODE else 2
 LEARNING_RATE = 0.00001
-HIDDEN_SIZE = 64
-DROPOUT_RATE = 0.2
-SEQUENCE_LENGTH = 64
 WEIGHT_DECAY = 0.02
+DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
 
 # Set up logging
@@ -161,8 +166,6 @@ else:
     logger.info(f"Saving processed data to {PROCESSED_DATA_PATH}...")
     data.to_pickle(PROCESSED_DATA_PATH)
 
-logger.info("Data processing complete.")
-
 # Define features and target
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
 x = data[feature_columns].values
@@ -201,6 +204,67 @@ def data_generator():
         # Clean labels and ensure they're within valid class range
         Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)
         yield X_batch, Y_batch
+
+def process_validation_data():
+    """ Processes the validation data similarly to the training data. """
+    # Load validation data
+    logger.info("Loading validation data...")
+    data = pd.read_csv(VALIDATION_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
+
+    # Sort by connection_id and time to ensure the data is in correct order
+    data.sort_values(by=['connection_id', 'time'], inplace=True)
+
+    # Calculate time difference between requests for each connection_id (in seconds)
+    data['time_diff'] = data.groupby('connection_id')['time'].diff()
+
+    # Calculate session duration for each connection_id (in seconds)
+    data['session_duration'] = data.groupby('connection_id')['time'].transform(lambda x: x.max() - x.min())
+
+    # Process the data in chunks
+    processed_chunks = []
+    chunk_counter = 0
+    for start_row in range(0, len(data), CHUNK_SIZE):
+        chunk = data.iloc[start_row:start_row + CHUNK_SIZE]
+        processed_chunks.append(process_chunk(chunk))
+        chunk_counter += 1
+        if chunk_counter % 100 == 0:  # Log every 100 chunks
+            logger.info(f"Processed chunk {chunk_counter}")
+
+    # Concatenate processed chunks
+    data = pd.concat(processed_chunks, ignore_index=True)
+
+    # Save processed data
+    logger.info(f"Saving processed validation data to {PROCESSED_DATA_PATH}...")
+    data.to_pickle(PROCESSED_DATA_PATH)
+
+    logger.info("Validation data processing complete.")
+    return data
+
+# Load or process validation data
+if os.path.exists(PROCESSED_DATA_VALIDATION_PATH):
+    logger.info("Loading processed validation data from file...")
+    validation_data = pd.read_pickle(PROCESSED_DATA_VALIDATION_PATH)
+else:
+    validation_data = process_validation_data()
+
+# Define features and target for validation data
+validation_feature_columns = [col for col in validation_data.columns if col != TARGET_COLUMN]
+validation_x = validation_data[validation_feature_columns].values
+validation_y = validation_data[TARGET_COLUMN].values
+
+# Function to create sequences for validation data in batches
+def validation_data_generator():
+    """ Generator function for validation data in batches """
+    for X_batch, Y_batch in create_sequences_batch(validation_x, validation_y, SEQUENCE_LENGTH, BATCH_SIZE):
+        X_batch = torch.nan_to_num(X_batch, nan=0.0, posinf=1e10, neginf=-1e10)
+        X_batch = torch.clamp(X_batch, min=0.0)
+        X_batch = torch.log1p(X_batch).to(device)
+
+        # Clean labels and ensure they're within valid class range
+        Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)
+        yield X_batch, Y_batch
+
+logger.info("Data processing complete.")
 
 # Define the LSTM model with multi-head attention
 class LSTMModel(nn.Module):
@@ -261,15 +325,25 @@ class LSTMModel(nn.Module):
 model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
 
 # Criterion and optimizer
-criterion = nn.CrossEntropyLoss()
+class_weights = torch.tensor([1.0, 10.0])  # Heavier penalty for class 1
+criterion = nn.CrossEntropyLoss(weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+
+# Early stopping parameters
+early_stopping_patience = 2  # Stop after 5 epochs without improvement
+best_val_loss = float('inf')  # Initialize to a very high value
+epochs_without_improvement = 0
+
+logger.info("Start training model...")
 
 # Training loop
 for epoch in range(EPOCHS):
-    model.train()
+    model.train()  # Set the model to training mode
     running_loss = 0.0
     batch_counter = 0
+
+    # Training loop
     for X_batch, y_batch in data_generator():
         optimizer.zero_grad()
         outputs = model(X_batch)
@@ -282,9 +356,40 @@ for epoch in range(EPOCHS):
         if batch_counter % 100 == 0:
             logger.info(f"Epoch {epoch+1}/{EPOCHS}, Processed {batch_counter} batches, Running Loss: {running_loss / batch_counter:.4f}")
 
-    scheduler.step()
-    logger.info(f"Epoch {epoch+1}/{EPOCHS}, Loss: {running_loss / batch_counter:.4f}")
+    # Log training loss at the end of the epoch
+    logger.info(f"Epoch {epoch+1}/{EPOCHS}, Training Loss: {running_loss / batch_counter:.4f}")
 
-# Save the model
+    # Validation loop: calculate validation loss once per epoch
+    model.eval()  # Set the model to evaluation mode
+    val_loss = 0.0
+    val_counter = 0
+    with torch.no_grad():
+        for X_batch_val, y_batch_val in validation_data_generator():
+            outputs_val = model(X_batch_val)
+            loss_val = criterion(outputs_val, y_batch_val)
+            val_loss += loss_val.item()
+            val_counter += 1
+
+    # Log validation loss at the end of the epoch
+    avg_val_loss = val_loss / val_counter
+    logger.info(f"Epoch {epoch+1}/{EPOCHS}, Validation Loss: {avg_val_loss:.4f}")
+
+    # Step scheduler: reduce learning rate if validation loss plateaus
+    scheduler.step(avg_val_loss)
+
+    # Early stopping check
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        epochs_without_improvement = 0  # Reset counter if we have an improvement
+    else:
+        epochs_without_improvement += 1
+        logger.info(f"No improvement for {epochs_without_improvement} epochs.")
+
+    # Stop training if validation loss hasn't improved for `early_stopping_patience` epochs
+    if epochs_without_improvement >= early_stopping_patience:
+        logger.info(f"Validation loss has not improved for {early_stopping_patience} epochs. Stopping training.")
+        break
+
+# Save the model at the end of training
 torch.save(model.state_dict(), MODEL_PATH)
 logger.info(f"Model saved to {MODEL_PATH}")
