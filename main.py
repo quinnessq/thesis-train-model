@@ -14,17 +14,17 @@ TEST_MODE = False
 TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\training.csv'
 #TRAINING_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\validation.csv'
 PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_training.pkl'  # Path for processed data
+#PROCESSED_DATA_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstuderen\trainingdata\processed_data_training_test.pkl'  # Path for processed data
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
-BATCH_SIZE = 512
+BATCH_SIZE = 128
 CHUNK_SIZE = 512
 EPOCHS = 10 if not TEST_MODE else 2
-LEARNING_RATE = 1e-5
-HIDDEN_SIZE = 256
+LEARNING_RATE = 0.00001
+HIDDEN_SIZE = 64
 DROPOUT_RATE = 0.2
-RANDOM_STATE = 42
-SEQUENCE_LENGTH = 256
-WEIGHT_DECAY = 1e-3
+SEQUENCE_LENGTH = 64
+WEIGHT_DECAY = 0.02
 OUTPUT_SIZE = 2
 
 # Set up logging
@@ -55,12 +55,33 @@ def expand_tokens(data, column_name, num_columns):
     data = pd.concat([data, token_columns], axis=1).drop(columns=[column_name])
     return data
 
+def aggregate_connection_features(data):
+    """ Aggregate features for each connection_id """
+
+    # Aggregate features
+    aggregated_features = data.groupby('connection_id').agg(
+        num_requests=('request_uri', 'count'),
+        avg_response_time=('response_time', 'mean'),
+        max_response_time=('response_time', 'max'),
+        count_slow_requests=('response_time', lambda x: (x > 0.75).sum()),  # Slow requests > 0.75s
+        avg_time_between_requests=('time_diff', 'mean'),  # Average time between requests
+        session_duration=('session_duration', 'mean'),  # Duration of session (mean)
+        total_response_size=('response_body_size', 'sum'),
+        avg_response_size=('response_body_size', 'mean'),
+        unique_uris=('request_uri', 'nunique'),  # Count unique request URIs
+    ).reset_index()
+
+    # Now calculate request_frequency as requests per unit time (e.g., per second)
+    aggregated_features['request_frequency'] = aggregated_features['num_requests'] / aggregated_features['session_duration']
+
+    return aggregated_features
+
 def process_chunk(chunk):
     """ Process each chunk of data """
     # Ensure chunk is a copy to avoid SettingWithCopyWarning
     chunk = chunk.copy()
 
-    # Replace NaNs with empty strings and convert to strings
+    # Replace NaNs with empty strings and convert to strings using .loc
     chunk.loc[:, 'request_uri'] = chunk['request_uri'].fillna('').astype(str)
     chunk.loc[:, 'user_agent'] = chunk['user_agent'].fillna('').astype(str)
 
@@ -74,13 +95,13 @@ def process_chunk(chunk):
 
     # Encode categorical features
     le = LabelEncoder()
-    chunk['method_encoded'] = le.fit_transform(chunk['request_method'].fillna('UNKNOWN'))
-    chunk['protocol_encoded'] = le.fit_transform(chunk['protocol'].fillna('UNKNOWN'))
-    chunk['referrer_encoded'] = le.fit_transform(chunk['referrer'].fillna('UNKNOWN'))
-    chunk['request_content_type_encoded'] = le.fit_transform(chunk['request_content_type'].fillna('UNKNOWN'))
+    chunk.loc[:, 'method_encoded'] = le.fit_transform(chunk['request_method'].fillna('UNKNOWN'))
+    chunk.loc[:, 'protocol_encoded'] = le.fit_transform(chunk['protocol'].fillna('UNKNOWN'))
+    chunk.loc[:, 'referrer_encoded'] = le.fit_transform(chunk['referrer'].fillna('UNKNOWN'))
+    chunk.loc[:, 'request_content_type_encoded'] = le.fit_transform(chunk['request_content_type'].fillna('UNKNOWN'))
 
     # Convert IP addresses and handle missing values
-    chunk['remote_ip_int'] = chunk['remote_ip'].apply(lambda ip: int(ip.replace('.', '')) if pd.notna(ip) else 0)
+    chunk.loc[:, 'remote_ip_int'] = chunk['remote_ip'].apply(lambda ip: int(ip.replace('.', '')) if pd.notna(ip) else 0)
     chunk.fillna({
         'remote_port': -1,
         'connection_id': -1,
@@ -93,7 +114,11 @@ def process_chunk(chunk):
         'request_content_length': -1
     }, inplace=True)
 
-    # Drop original columns
+    # Create aggregated connection features
+    aggregated_features = aggregate_connection_features(chunk)
+    chunk = chunk.merge(aggregated_features, on='connection_id', how='left')
+
+    # Drop original columns we don't need anymore
     chunk.drop(columns=['date', 'remote_ip', 'request_method', 'protocol', 'referrer', 'user_agent', 'request_uri',
                         'upstream_response_time', 'request_content_type'], inplace=True)
 
@@ -110,7 +135,13 @@ else:
     # Sort by connection_id and time to ensure the data is in correct order
     data.sort_values(by=['connection_id', 'time'], inplace=True)
 
-    # Now process the data in chunks
+    # Calculate time difference between requests for each connection_id (in seconds)
+    data['time_diff'] = data.groupby('connection_id')['time'].diff()
+
+    # Calculate session duration for each connection_id (in seconds)
+    data['session_duration'] = data.groupby('connection_id')['time'].transform(lambda x: x.max() - x.min())
+
+    # Process the data in chunks
     processed_chunks = []
     chunk_counter = 0  # Initialize chunk counter
     for start_row in range(0, len(data), CHUNK_SIZE):
@@ -171,7 +202,7 @@ def data_generator():
         Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)
         yield X_batch, Y_batch
 
-# Define the LSTM model
+# Define the LSTM model with multi-head attention
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
@@ -201,7 +232,6 @@ class LSTMModel(nn.Module):
         lstm_out, _ = self.lstm(x)
 
         # Transformer-based attention
-        # We need to reshape the LSTM output for multihead attention (batch, seq_len, hidden_size*2) -> (seq_len, batch, hidden_size*2)
         lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size*2) -> (seq_len, batch, hidden_size*2)
 
         # Pass through multihead attention layer
