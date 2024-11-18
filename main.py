@@ -23,15 +23,16 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
 BATCH_SIZE = 128
-HIDDEN_SIZE = 64
-SEQUENCE_LENGTH = 64
+HIDDEN_SIZE = 128
+SEQUENCE_LENGTH = 32
 
 CHUNK_SIZE = 2000
-EPOCHS = 10 if not TEST_MODE else 2
+EPOCHS = 20 if not TEST_MODE else 2
 LEARNING_RATE = 0.00001
 WEIGHT_DECAY = 0.02
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
+EARLY_STOPPING_PATIENCE = 5  # Stop after 5 epochs without improvement
 
 pd.set_option('display.max_columns', None)  # Show all columns
 pd.set_option('display.max_rows', None)     # Show all rows (if necessary)
@@ -121,7 +122,7 @@ def process_chunk(chunk):
     # Ensure chunk is a copy to avoid SettingWithCopyWarning
     chunk = chunk.copy()
     unique_values = np.unique(chunk[TARGET_COLUMN])
-    print(f"Received chunk contains entries: {unique_values}")
+    #print(f"Received chunk contains entries: {unique_values}")
 
     # Replace NaNs with empty strings and convert to strings using .loc
     chunk.loc[:, 'request_uri'] = chunk['request_uri'].fillna('').astype(str)
@@ -166,32 +167,29 @@ def process_chunk(chunk):
                         'upstream_response_time', 'request_content_type'], inplace=True)
 
     unique_values = np.unique(chunk[TARGET_COLUMN])
-    print(f"After processing chunk contains entries: {unique_values}")
+    #print(f"After processing chunk contains entries: {unique_values}")
 
     return chunk
 
-# Check if processed data exists and load it, otherwise process raw data
-if os.path.exists(PROCESSED_DATA_PATH):
-    logger.info("Loading processed data from file...")
-    data = pd.read_pickle(PROCESSED_DATA_PATH)
-else:
-    logger.info("Loading and sorting the dataset...")
+def process_training_data():
+    global data
     data = pd.read_csv(TRAINING_DATA_PATH, sep=",", encoding='utf-8', low_memory=False)
-
     logger.info(f"Data type of 'malicious' before conversion: {data['malicious'].dtype}")
     data[TARGET_COLUMN] = data[TARGET_COLUMN].astype('int')  # Convert to integer
     logger.info(f"Data type of 'malicious' after conversion: {data['malicious'].dtype}")
     print(f"After changing data type for all data: {np.unique(data[TARGET_COLUMN])}")
-
     # Sort by connection_id and time to ensure the data is in correct order
-    data.sort_values(by=['connection_id', 'time'], inplace=True)
-
+    data.sort_values(by=['connection_id', 'time'], inplace=True, ascending=False)
+    # Step 1: Group by 'connection_id'
+    grouped = data.groupby('connection_id')
+    # Step 2: Randomize the order of the groups
+    data = grouped.apply(lambda x: x.sample(frac=1)).reset_index(drop=True)
+    # Log that we've randomized the groups
+    logger.info("Randomized the order of connection_id groups.")
     # Calculate time difference between requests for each connection_id (in seconds)
     data['time_diff'] = data.groupby('connection_id')['time'].diff()
-
     # Calculate session duration for each connection_id (in seconds)
     data['session_duration'] = data.groupby('connection_id')['time'].transform(lambda x: x.max() - x.min())
-
     # Process the data in chunks
     processed_chunks = []
     chunk_counter = 0  # Initialize chunk counter
@@ -224,21 +222,11 @@ else:
         # Log every 100 chunks
         if chunk_counter % 100 == 0:
             logger.info(f"Processed chunk {chunk_counter}")
-
     # Concatenate all processed chunks
     data = pd.concat(processed_chunks, ignore_index=True)
-
     # Save processed data for future use
     logger.info(f"Saving processed data to {PROCESSED_DATA_PATH}...")
     data.to_pickle(PROCESSED_DATA_PATH)
-
-
-print(f"Data after processing chunks contains: {np.unique(data[TARGET_COLUMN])}")
-# Define features and target
-logger.info(f"Data types of columns in the dataset:\n{data.dtypes}")
-feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
-x = data[feature_columns].values
-y = data[TARGET_COLUMN].values
 
 def create_sequences_batch(sequence_x, sequence_y, sequence_length, batch_size):
     """ Generate sequences in batches to avoid memory overflow """
@@ -287,12 +275,12 @@ def process_validation_data():
     print(f"After changing data type for all data: {np.unique(data[TARGET_COLUMN])}")
 
     # Sort by connection_id and time to ensure the data is in correct order
-    data.sort_values(by=['connection_id', 'time'], inplace=True)
+    data.sort_values(by=['connection_id', 'time'], inplace=True, ascending=False)
+    grouped = data.groupby('connection_id')
+    data = grouped.apply(lambda x: x.sample(frac=1)).reset_index(drop=True)
+    logger.info("Randomized the order of connection_id groups.")
 
-    # Calculate time difference between requests for each connection_id (in seconds)
     data['time_diff'] = data.groupby('connection_id')['time'].diff()
-
-    # Calculate session duration for each connection_id (in seconds)
     data['session_duration'] = data.groupby('connection_id')['time'].transform(lambda x: x.max() - x.min())
 
     # Process the data in chunks
@@ -342,18 +330,6 @@ def process_validation_data():
     logger.info("Validation data processing complete.")
     return data
 
-# Load or process validation data
-if os.path.exists(PROCESSED_DATA_VALIDATION_PATH):
-    logger.info("Loading processed validation data from file...")
-    validation_data = pd.read_pickle(PROCESSED_DATA_VALIDATION_PATH)
-else:
-    validation_data = process_validation_data()
-
-# Define features and target for validation data
-validation_feature_columns = [col for col in validation_data.columns if col != TARGET_COLUMN]
-validation_x = validation_data[validation_feature_columns].values
-validation_y = validation_data[TARGET_COLUMN].values
-
 # Function to create sequences for validation data in batches
 def validation_data_generator():
     """ Generator function for validation data in batches """
@@ -366,6 +342,33 @@ def validation_data_generator():
         # Clean labels and ensure they're within valid class range
         Y_batch = torch.clamp(Y_batch, min=0, max=OUTPUT_SIZE - 1).to(device)  # Ensure labels are on the correct device
         yield X_batch, Y_batch
+
+# Check if processed data exists and load it, otherwise process raw data
+if os.path.exists(PROCESSED_DATA_PATH):
+    logger.info("Loading processed data from file...")
+    data = pd.read_pickle(PROCESSED_DATA_PATH)
+else:
+    logger.info("Loading and sorting the dataset...")
+    process_training_data()
+
+print(f"Data after processing chunks contains: {np.unique(data[TARGET_COLUMN])}")
+# Define features and target
+logger.info(f"Data types of columns in the dataset:\n{data.dtypes}")
+feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
+x = data[feature_columns].values
+y = data[TARGET_COLUMN].values
+
+# Load or process validation data
+if os.path.exists(PROCESSED_DATA_VALIDATION_PATH):
+    logger.info("Loading processed validation data from file...")
+    validation_data = pd.read_pickle(PROCESSED_DATA_VALIDATION_PATH)
+else:
+    validation_data = process_validation_data()
+
+# Define features and target for validation data
+validation_feature_columns = [col for col in validation_data.columns if col != TARGET_COLUMN]
+validation_x = validation_data[validation_feature_columns].values
+validation_y = validation_data[TARGET_COLUMN].values
 
 logger.info("Data processing complete.")
 
@@ -428,12 +431,11 @@ class LSTMModel(nn.Module):
 model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
 
 # Criterion and optimizer
-print(np.unique(y))  # This should print valid class labels, e.g., [0, 1] for binary classification
 class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
 class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, weight=None, reduction='mean'):
+    def __init__(self, alpha=0.35, gamma=1.50, weight=None, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -452,14 +454,12 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=class_weights)
-
 # Use the computed class weights in your loss function
+criterion = FocalLoss(alpha=0.35, gamma=1.50, weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
 
 # Early stopping parameters
-early_stopping_patience = 2  # Stop after 5 epochs without improvement
 best_val_loss = float('inf')  # Initialize to a very high value
 epochs_without_improvement = 0
 
@@ -468,59 +468,63 @@ for name, param in model.named_parameters():
 
 logger.info("Start training model...")
 
+def train_data():
+    global best_val_loss, epochs_without_improvement
+    for epoch in range(EPOCHS):
+        model.train()  # Set the model to training mode
+        running_loss = 0.0
+        batch_counter = 0
+
+        # Training loop
+        for X_batch, y_batch in data_generator():
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            running_loss += loss.item()
+            batch_counter += 1
+            if batch_counter % 100 == 0:
+                logger.info(f"Epoch {epoch + 1}/{EPOCHS}, Processed {batch_counter} batches, Running Loss: {running_loss / batch_counter:.4f}")
+
+        # Log training loss at the end of the epoch
+        logger.info(f"Epoch {epoch + 1}/{EPOCHS}, Training Loss: {running_loss / batch_counter:.4f}")
+
+        # Validation loop: calculate validation loss once per epoch
+        model.eval()  # Set the model to evaluation mode
+        val_loss = 0.0
+        val_counter = 0
+        with torch.no_grad():
+            for X_batch_val, y_batch_val in validation_data_generator():
+                # Ensure validation data is on the correct device
+                outputs_val = model(X_batch_val)  # Model output
+                loss_val = criterion(outputs_val, y_batch_val)  # Compute validation loss on the correct device
+                val_loss += loss_val.item()
+                val_counter += 1
+
+        # Log validation loss at the end of the epoch
+        avg_val_loss = val_loss / val_counter
+        logger.info(f"Epoch {epoch + 1}/{EPOCHS}, Validation Loss: {avg_val_loss:.4f}")
+
+        # Step scheduler: reduce learning rate if validation loss plateaus
+        scheduler.step(avg_val_loss)
+
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_without_improvement = 0  # Reset counter if we have an improvement
+        else:
+            epochs_without_improvement += 1
+            logger.info(f"No improvement for {epochs_without_improvement} epochs.")
+
+        # Stop training if validation loss hasn't improved for `early_stopping_patience` epochs
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            logger.info(f"Validation loss has not improved for {EARLY_STOPPING_PATIENCE} epochs. Stopping training.")
+            break
+
 # Training loop
-for epoch in range(EPOCHS):
-    model.train()  # Set the model to training mode
-    running_loss = 0.0
-    batch_counter = 0
-
-    # Training loop
-    for X_batch, y_batch in data_generator():
-        optimizer.zero_grad()
-        outputs = model(X_batch)
-        loss = criterion(outputs, y_batch)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
-        running_loss += loss.item()
-        batch_counter += 1
-        if batch_counter % 100 == 0:
-            logger.info(f"Epoch {epoch+1}/{EPOCHS}, Processed {batch_counter} batches, Running Loss: {running_loss / batch_counter:.4f}")
-
-    # Log training loss at the end of the epoch
-    logger.info(f"Epoch {epoch+1}/{EPOCHS}, Training Loss: {running_loss / batch_counter:.4f}")
-
-    # Validation loop: calculate validation loss once per epoch
-    model.eval()  # Set the model to evaluation mode
-    val_loss = 0.0
-    val_counter = 0
-    with torch.no_grad():
-        for X_batch_val, y_batch_val in validation_data_generator():
-            # Ensure validation data is on the correct device
-            outputs_val = model(X_batch_val)  # Model output
-            loss_val = criterion(outputs_val, y_batch_val)  # Compute validation loss on the correct device
-            val_loss += loss_val.item()
-            val_counter += 1
-
-    # Log validation loss at the end of the epoch
-    avg_val_loss = val_loss / val_counter
-    logger.info(f"Epoch {epoch+1}/{EPOCHS}, Validation Loss: {avg_val_loss:.4f}")
-
-    # Step scheduler: reduce learning rate if validation loss plateaus
-    scheduler.step(avg_val_loss)
-
-    # Early stopping check
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        epochs_without_improvement = 0  # Reset counter if we have an improvement
-    else:
-        epochs_without_improvement += 1
-        logger.info(f"No improvement for {epochs_without_improvement} epochs.")
-
-    # Stop training if validation loss hasn't improved for `early_stopping_patience` epochs
-    if epochs_without_improvement >= early_stopping_patience:
-        logger.info(f"Validation loss has not improved for {early_stopping_patience} epochs. Stopping training.")
-        break
+train_data()
 
 # Save the model at the end of training
 torch.save(model.state_dict(), MODEL_PATH)

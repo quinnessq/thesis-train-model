@@ -15,9 +15,11 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 MODEL_PATH = 'lstm_model.pth'
+
 BATCH_SIZE = 128
-HIDDEN_SIZE = 64
-SEQUENCE_LENGTH = 64
+HIDDEN_SIZE = 128
+SEQUENCE_LENGTH = 32
+
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
 
