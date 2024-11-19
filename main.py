@@ -22,17 +22,17 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
-BATCH_SIZE = 128
-HIDDEN_SIZE = 128
-SEQUENCE_LENGTH = 32
+BATCH_SIZE = 4096
+HIDDEN_SIZE = 64
+SEQUENCE_LENGTH = 4096
 
 CHUNK_SIZE = 2000
-EPOCHS = 20 if not TEST_MODE else 2
-LEARNING_RATE = 0.00001
-WEIGHT_DECAY = 0.02
+EPOCHS = 30 if not TEST_MODE else 1
+LEARNING_RATE = 0.0001
+WEIGHT_DECAY = 0.005
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
-EARLY_STOPPING_PATIENCE = 5  # Stop after 5 epochs without improvement
+EARLY_STOPPING_PATIENCE = 5
 
 pd.set_option('display.max_columns', None)  # Show all columns
 pd.set_option('display.max_rows', None)     # Show all rows (if necessary)
@@ -351,9 +351,10 @@ else:
     logger.info("Loading and sorting the dataset...")
     process_training_data()
 
-print(f"Data after processing chunks contains: {np.unique(data[TARGET_COLUMN])}")
+#print(f"Data after processing chunks contains: {np.unique(data[TARGET_COLUMN])}")
 # Define features and target
-logger.info(f"Data types of columns in the dataset:\n{data.dtypes}")
+#logger.info(f"Data types of columns in the dataset:\n{data.dtypes}")
+
 feature_columns = [col for col in data.columns if col != TARGET_COLUMN]
 x = data[feature_columns].values
 y = data[TARGET_COLUMN].values
@@ -377,16 +378,17 @@ class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
 
-        # LSTM layer (bidirectional)
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=4, bidirectional=True, batch_first=True, dropout=dropout_rate)
+        # LSTM layer (bidirectional) with an additional layer (num_layers=5)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=True, batch_first=True, dropout=dropout_rate)
 
         # Transformer-based multi-head attention
         self.attention = nn.MultiheadAttention(embed_dim=hidden_size * 2, num_heads=4, dropout=dropout_rate)
 
-        # Fully connected layers (MLP)
-        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.fc3 = nn.Linear(hidden_size // 2, output_size)
+        # Fully connected layers (MLP) with an additional layer
+        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)  # First FC layer
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)  # Second FC layer
+        self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)  # Third FC layer (new one)
+        self.fc4 = nn.Linear(hidden_size // 4, output_size)  # Output layer
 
         # Dropout layer for regularization
         self.dropout = nn.Dropout(dropout_rate)
@@ -423,7 +425,11 @@ class LSTMModel(nn.Module):
         out = self.relu(out)
         out = self.dropout(out)
 
-        out = self.fc3(out)  # Final output (raw logits)
+        out = self.fc3(out)  # Third FC layer
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = self.fc4(out)  # Final output (raw logits)
 
         return out
 
@@ -435,7 +441,7 @@ class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(
 class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.35, gamma=1.50, weight=None, reduction='mean'):
+    def __init__(self, alpha=0.30, gamma=2.5, weight=None, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -455,16 +461,17 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 # Use the computed class weights in your loss function
-criterion = FocalLoss(alpha=0.35, gamma=1.50, weight=class_weights)
+criterion = FocalLoss(alpha=0.30, gamma=2.5, weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
 
 # Early stopping parameters
 best_val_loss = float('inf')  # Initialize to a very high value
+last_val_loss = float('inf')
 epochs_without_improvement = 0
 
-for name, param in model.named_parameters():
-    print(f"Parameter {name} is on device {param.device}")
+#for name, param in model.named_parameters():
+#    print(f"Parameter {name} is on device {param.device}")
 
 logger.info("Start training model...")
 
@@ -510,10 +517,13 @@ def train_data():
         # Step scheduler: reduce learning rate if validation loss plateaus
         scheduler.step(avg_val_loss)
 
+        last_val_loss = avg_val_loss
+
         # Early stopping check
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             epochs_without_improvement = 0  # Reset counter if we have an improvement
+            torch.save(model.state_dict(), MODEL_PATH) #when it's low lets save it as we might not get better
         else:
             epochs_without_improvement += 1
             logger.info(f"No improvement for {epochs_without_improvement} epochs.")
@@ -527,5 +537,6 @@ def train_data():
 train_data()
 
 # Save the model at the end of training
-torch.save(model.state_dict(), MODEL_PATH)
-logger.info(f"Model saved to {MODEL_PATH}")
+if last_val_loss < best_val_loss:
+    torch.save(model.state_dict(), MODEL_PATH)
+    logger.info(f"Model saved to {MODEL_PATH}")

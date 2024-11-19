@@ -16,9 +16,9 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 MODEL_PATH = 'lstm_model.pth'
 
-BATCH_SIZE = 128
-HIDDEN_SIZE = 128
-SEQUENCE_LENGTH = 32
+BATCH_SIZE = 4096
+HIDDEN_SIZE = 64
+SEQUENCE_LENGTH = 4096
 
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
@@ -81,16 +81,17 @@ class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
 
-        # LSTM layer (bidirectional)
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=4, bidirectional=True, batch_first=True, dropout=dropout_rate)
+        # LSTM layer (bidirectional) with an additional layer (num_layers=5)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=True, batch_first=True, dropout=dropout_rate)
 
         # Transformer-based multi-head attention
         self.attention = nn.MultiheadAttention(embed_dim=hidden_size * 2, num_heads=4, dropout=dropout_rate)
 
-        # Fully connected layers (MLP)
-        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.fc3 = nn.Linear(hidden_size // 2, output_size)
+        # Fully connected layers (MLP) with an additional layer
+        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)  # First FC layer
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)  # Second FC layer
+        self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)  # Third FC layer (new one)
+        self.fc4 = nn.Linear(hidden_size // 4, output_size)  # Output layer
 
         # Dropout layer for regularization
         self.dropout = nn.Dropout(dropout_rate)
@@ -127,7 +128,11 @@ class LSTMModel(nn.Module):
         out = self.relu(out)
         out = self.dropout(out)
 
-        out = self.fc3(out)  # Final output (raw logits, no activation)
+        out = self.fc3(out)  # Third FC layer
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = self.fc4(out)  # Final output (raw logits)
 
         return out
 
