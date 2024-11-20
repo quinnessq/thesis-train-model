@@ -344,11 +344,10 @@ class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
 
-        # LSTM layer (unidirectional) with an additional layer (num_layers=5)
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=False, batch_first=True, dropout=dropout_rate)
 
         # Transformer-based multi-head attention
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=2, dropout=dropout_rate)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=4, dropout=dropout_rate)
 
         # Fully connected layers (MLP)
         self.fc1 = nn.Linear(hidden_size, hidden_size)
@@ -356,48 +355,23 @@ class LSTMModel(nn.Module):
         self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)
         self.fc4 = nn.Linear(hidden_size // 4, output_size)
 
-        # Dropout layer for regularization
         self.dropout = nn.Dropout(dropout_rate)
-
-        # ReLU activation
         self.relu = nn.ReLU()
-
-        # Layer normalization (after dropout and activation)
         self.layer_norm = nn.LayerNorm(hidden_size)
 
     def forward(self, x, hidden=None):
-        """
-        Forward pass for LSTM model. If hidden states are provided, use them, else initialize new hidden states.
-
-        :param x: Input tensor with shape (batch_size, sequence_length, input_size)
-        :param hidden: Tuple (h0, c0) containing initial hidden and cell states. If None, they will be initialized.
-        :return: The output after passing through LSTM, attention, and fully connected layers.
-        """
-        # If hidden states are not passed, initialize them as zeros
         if hidden is None:
-            h0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)  # num_layers=5
-            c0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)  # num_layers=5
+            h0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)
+            c0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)
         else:
             h0, c0 = hidden
-
-        # Get LSTM outputs and hidden states
         lstm_out, (h_n, c_n) = self.lstm(x, (h0, c0))
-
-        # Detach hidden states from the computation graph to prevent backpropagating through previous batches
         h_n = h_n.detach()
         c_n = c_n.detach()
-
-        # Transformer-based attention
-        lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size) -> (seq_len, batch, hidden_size)
-
-        # Pass through multihead attention layer
+        lstm_out_transpose = lstm_out.permute(1, 0, 2)
         attn_output, _ = self.attention(lstm_out_transpose, lstm_out_transpose, lstm_out_transpose)
-
-        # The output is the weighted sum of the input sequence, now we revert the permutation
-        attn_output = attn_output.permute(1, 0, 2)  # (seq_len, batch, hidden_size) -> (batch, seq_len, hidden_size)
-
-        # Use the last time step's output for classification
-        context = attn_output[:, -1, :]  # Take the output at the last timestep
+        attn_output = attn_output.permute(1, 0, 2)
+        context = attn_output[:, -1, :]
 
         # Fully connected layers with ReLU activations and dropout
         out = self.fc1(context)
@@ -416,7 +390,7 @@ class LSTMModel(nn.Module):
         out = self.fc4(out)  # Final output (raw logits)
 
         # Return the output and the new hidden states for the next iteration
-        return out, (h_n, c_n)
+        return out, (h_n, c_n)  # Return the new hidden state and cell state for the next time step
 
 # Model initialization
 model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
@@ -446,8 +420,8 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 # Use the computed class weights in your loss function
-criterion = FocalLoss(alpha=0.35, gamma=4.0, weight=class_weights)
-#criterion = nn.CrossEntropyLoss(weight=class_weights)
+#criterion = FocalLoss(alpha=0.35, gamma=4.0, weight=class_weights)
+criterion = nn.CrossEntropyLoss(weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler = ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
 
@@ -467,33 +441,19 @@ def train_data():
         correct_preds = 0  # Track correct predictions for accuracy
         total_preds = 0  # Track total predictions
 
-        # Initialize the hidden state for training (set to None for LSTM/GRU)
-        hidden = None  # Reset hidden state at the start of each epoch
+        hidden = None
 
         # Training loop
         for X_batch, y_batch in data_generator():
             optimizer.zero_grad()
-
-            # Pass the current hidden state to the model and get the output
             outputs, hidden = model(X_batch, hidden)
-
-            # Calculate loss
+            hidden = tuple([h.detach() for h in hidden])
             loss = criterion(outputs, y_batch)
-
-            # Perform backward pass and update weights (without retain_graph)
             loss.backward()
-
-            # Clip gradients to avoid exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-
-            # Update the model parameters
             optimizer.step()
-
-            # Track running loss and accuracy
             running_loss += loss.item()
             batch_counter += 1
-
-            # Calculate training accuracy
             _, predicted = torch.max(outputs, 1)  # Get the predicted class (assumes classification task)
             correct_preds += (predicted == y_batch).sum().item()  # Count correct predictions
             total_preds += y_batch.size(0)  # Count total number of examples
@@ -509,19 +469,22 @@ def train_data():
                     f"Training Accuracy: {train_accuracy:.4f}")
 
         # Validation loop: calculate validation loss and accuracy once per epoch
-        model.eval()  # Set the model to evaluation mode
+        model.eval()
         val_loss = 0.0
         val_counter = 0
-        val_correct_preds = 0  # Track correct predictions for validation accuracy
-        val_total_preds = 0  # Track total predictions for validation
+        val_correct_preds = 0
+        val_total_preds = 0
 
-        # Initialize the hidden state for validation
-        hidden = None  # Reset hidden state at the start of validation
+        # Initialize the hidden state for validation (this will be retained across batches)
+        hidden_validation = None  # Only reset at the start of the validation phase
 
         with torch.no_grad():
             for X_batch_val, y_batch_val in validation_data_generator():
                 # Pass the current hidden state to the model and get the output
-                outputs_val, hidden = model(X_batch_val, hidden)
+                outputs_val, hidden_validation = model(X_batch_val, hidden_validation)
+
+                # Detach hidden states from the graph for validation (to save memory)
+                hidden_validation = tuple([h.detach() for h in hidden_validation])  # Detach the hidden state to avoid backprop
 
                 # Compute validation loss
                 loss_val = criterion(outputs_val, y_batch_val)
