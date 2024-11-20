@@ -16,9 +16,9 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 TARGET_COLUMN = 'malicious'  # Target variable for classification
 MODEL_PATH = 'lstm_model.pth'
 
-BATCH_SIZE = 4096
+BATCH_SIZE = 8192
 HIDDEN_SIZE = 64
-SEQUENCE_LENGTH = 4096
+SEQUENCE_LENGTH = 8192
 
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
@@ -81,14 +81,15 @@ class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
 
-        # LSTM layer (bidirectional) with an additional layer (num_layers=5)
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=True, batch_first=True, dropout=dropout_rate)
+        # LSTM layer (unidirectional) with an additional layer (num_layers=5)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=False, batch_first=True, dropout=dropout_rate)
 
         # Transformer-based multi-head attention
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size * 2, num_heads=4, dropout=dropout_rate)
+        # Since the LSTM is now unidirectional, we set embed_dim to hidden_size (not hidden_size * 2)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=4, dropout=dropout_rate)
 
         # Fully connected layers (MLP) with an additional layer
-        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)  # First FC layer
+        self.fc1 = nn.Linear(hidden_size, hidden_size)  # First FC layer
         self.fc2 = nn.Linear(hidden_size, hidden_size // 2)  # Second FC layer
         self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)  # Third FC layer (new one)
         self.fc4 = nn.Linear(hidden_size // 4, output_size)  # Output layer
@@ -107,13 +108,13 @@ class LSTMModel(nn.Module):
         lstm_out, _ = self.lstm(x)
 
         # Transformer-based attention
-        lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size*2) -> (seq_len, batch, hidden_size*2)
+        lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size) -> (seq_len, batch, hidden_size)
 
         # Pass through multihead attention layer
         attn_output, _ = self.attention(lstm_out_transpose, lstm_out_transpose, lstm_out_transpose)
 
         # The output is the weighted sum of the input sequence, now we revert the permutation
-        attn_output = attn_output.permute(1, 0, 2)  # (seq_len, batch, hidden_size*2) -> (batch, seq_len, hidden_size*2)
+        attn_output = attn_output.permute(1, 0, 2)  # (seq_len, batch, hidden_size) -> (batch, seq_len, hidden_size)
 
         # Use the last time step's output for classification
         context = attn_output[:, -1, :]  # Take the output at the last timestep

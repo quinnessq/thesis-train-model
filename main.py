@@ -22,17 +22,17 @@ PROCESSED_DATA_VALIDATION_PATH = r'C:\Users\alcui\Desktop\MSCE\Modules\Afstudere
 
 MODEL_PATH = 'lstm_model.pth'
 TARGET_COLUMN = 'malicious'
-BATCH_SIZE = 4096
+BATCH_SIZE = 8192
 HIDDEN_SIZE = 64
-SEQUENCE_LENGTH = 4096
+SEQUENCE_LENGTH = 8192
 
 CHUNK_SIZE = 2000
 EPOCHS = 30 if not TEST_MODE else 1
-LEARNING_RATE = 0.0001
-WEIGHT_DECAY = 0.005
+LEARNING_RATE = 0.0005
+WEIGHT_DECAY = 0.05
 DROPOUT_RATE = 0.2
 OUTPUT_SIZE = 2
-EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_PATIENCE = 10
 
 pd.set_option('display.max_columns', None)  # Show all columns
 pd.set_option('display.max_rows', None)     # Show all rows (if necessary)
@@ -378,14 +378,14 @@ class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
 
-        # LSTM layer (bidirectional) with an additional layer (num_layers=5)
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=True, batch_first=True, dropout=dropout_rate)
+        # LSTM layer (unidirectional) with an additional layer (num_layers=5)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=False, batch_first=True, dropout=dropout_rate)
 
         # Transformer-based multi-head attention
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size * 2, num_heads=4, dropout=dropout_rate)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=4, dropout=dropout_rate)
 
         # Fully connected layers (MLP) with an additional layer
-        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)  # First FC layer
+        self.fc1 = nn.Linear(hidden_size, hidden_size)  # First FC layer
         self.fc2 = nn.Linear(hidden_size, hidden_size // 2)  # Second FC layer
         self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)  # Third FC layer (new one)
         self.fc4 = nn.Linear(hidden_size // 4, output_size)  # Output layer
@@ -404,13 +404,13 @@ class LSTMModel(nn.Module):
         lstm_out, _ = self.lstm(x)
 
         # Transformer-based attention
-        lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size*2) -> (seq_len, batch, hidden_size*2)
+        lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size) -> (seq_len, batch, hidden_size)
 
         # Pass through multihead attention layer
         attn_output, _ = self.attention(lstm_out_transpose, lstm_out_transpose, lstm_out_transpose)
 
         # The output is the weighted sum of the input sequence, now we revert the permutation
-        attn_output = attn_output.permute(1, 0, 2)  # (seq_len, batch, hidden_size*2) -> (batch, seq_len, hidden_size*2)
+        attn_output = attn_output.permute(1, 0, 2)  # (seq_len, batch, hidden_size) -> (batch, seq_len, hidden_size)
 
         # Use the last time step's output for classification
         context = attn_output[:, -1, :]  # Take the output at the last timestep
@@ -441,7 +441,7 @@ class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(
 class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.30, gamma=2.5, weight=None, reduction='mean'):
+    def __init__(self, alpha=0.35, gamma=4.0, weight=None, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -461,7 +461,7 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 # Use the computed class weights in your loss function
-criterion = FocalLoss(alpha=0.30, gamma=2.5, weight=class_weights)
+criterion = FocalLoss(alpha=0.35, gamma=4.0, weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
 
@@ -524,6 +524,7 @@ def train_data():
             best_val_loss = avg_val_loss
             epochs_without_improvement = 0  # Reset counter if we have an improvement
             torch.save(model.state_dict(), MODEL_PATH) #when it's low lets save it as we might not get better
+            logger.info(f"Model saved to {MODEL_PATH}")
         else:
             epochs_without_improvement += 1
             logger.info(f"No improvement for {epochs_without_improvement} epochs.")
