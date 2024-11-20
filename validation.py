@@ -85,14 +85,13 @@ class LSTMModel(nn.Module):
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=False, batch_first=True, dropout=dropout_rate)
 
         # Transformer-based multi-head attention
-        # Since the LSTM is now unidirectional, we set embed_dim to hidden_size (not hidden_size * 2)
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=4, dropout=dropout_rate)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=2, dropout=dropout_rate)
 
-        # Fully connected layers (MLP) with an additional layer
-        self.fc1 = nn.Linear(hidden_size, hidden_size)  # First FC layer
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)  # Second FC layer
-        self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)  # Third FC layer (new one)
-        self.fc4 = nn.Linear(hidden_size // 4, output_size)  # Output layer
+        # Fully connected layers (MLP)
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
+        self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)
+        self.fc4 = nn.Linear(hidden_size // 4, output_size)
 
         # Dropout layer for regularization
         self.dropout = nn.Dropout(dropout_rate)
@@ -103,9 +102,27 @@ class LSTMModel(nn.Module):
         # Layer normalization (after dropout and activation)
         self.layer_norm = nn.LayerNorm(hidden_size)
 
-    def forward(self, x):
-        # Get LSTM outputs
-        lstm_out, _ = self.lstm(x)
+    def forward(self, x, hidden=None):
+        """
+        Forward pass for LSTM model. If hidden states are provided, use them, else initialize new hidden states.
+
+        :param x: Input tensor with shape (batch_size, sequence_length, input_size)
+        :param hidden: Tuple (h0, c0) containing initial hidden and cell states. If None, they will be initialized.
+        :return: The output after passing through LSTM, attention, and fully connected layers.
+        """
+        # If hidden states are not passed, initialize them as zeros
+        if hidden is None:
+            h0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)  # num_layers=5
+            c0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)  # num_layers=5
+        else:
+            h0, c0 = hidden
+
+        # Get LSTM outputs and hidden states
+        lstm_out, (h_n, c_n) = self.lstm(x, (h0, c0))
+
+        # Detach hidden states from the computation graph to prevent backpropagating through previous batches
+        h_n = h_n.detach()
+        c_n = c_n.detach()
 
         # Transformer-based attention
         lstm_out_transpose = lstm_out.permute(1, 0, 2)  # (batch, seq_len, hidden_size) -> (seq_len, batch, hidden_size)
@@ -135,12 +152,12 @@ class LSTMModel(nn.Module):
 
         out = self.fc4(out)  # Final output (raw logits)
 
-        return out
+        # Return the output and the new hidden states for the next iteration
+        return out, (h_n, c_n)
 
 # Model initialization
 input_size = len(feature_columns)
 logger.info(f"Feature column size: {input_size}")
-# Model initialization
 model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
 
 # Load the pre-trained model if available
@@ -163,31 +180,23 @@ y_true_list = []
 
 # Disable gradient computation for validation
 with torch.no_grad():
+    hidden = None  # Initialize the hidden state for evaluation
     for X_batch, y_batch in data_generator():
-        # Move data to the correct device (GPU or CPU)
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
-        # Get model predictions
-        outputs = model(X_batch)
-
-        # Compute loss (optional)
+        outputs, hidden = model(X_batch, hidden)
+        hidden = tuple([h.detach() for h in hidden])
         loss = criterion(outputs, y_batch)
-
-        # Log the loss value for monitoring
-        #logger.info(f"Validation Loss: {loss.item()}")
-
-        # Get predicted class labels
         _, y_pred = torch.max(outputs, 1)
-
-        # Collect predictions and true labels for metrics
         y_pred_list.extend(y_pred.cpu().numpy())
         y_true_list.extend(y_batch.cpu().numpy())
+
 
 # Generate confusion matrix
 cm = confusion_matrix(y_true_list, y_pred_list)
 
 # Plot confusion matrix
-labels = ['Class 0', 'Class 1']  # Adjust these according to your target classes
+labels = ['Benign', 'Malicious']  # Adjust these according to your target classes
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
 plt.xlabel('Predicted')
