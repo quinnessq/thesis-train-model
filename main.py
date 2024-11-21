@@ -344,59 +344,47 @@ class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
 
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=5, bidirectional=False, batch_first=True, dropout=dropout_rate)
+        # Single LSTM layer with dropout
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=1, batch_first=True, dropout=dropout_rate)
 
-        # Transformer-based multi-head attention
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=4, dropout=dropout_rate)
+        # Fully connected layers (simplified)
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.fc2 = nn.Linear(hidden_size // 2, output_size)
 
-        # Fully connected layers (MLP)
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.fc3 = nn.Linear(hidden_size // 2, hidden_size // 4)
-        self.fc4 = nn.Linear(hidden_size // 4, output_size)
-
+        # Dropout for regularization
         self.dropout = nn.Dropout(dropout_rate)
         self.relu = nn.ReLU()
-        self.layer_norm = nn.LayerNorm(hidden_size)
 
     def forward(self, x, hidden=None):
+        # Initialize hidden states if not provided
         if hidden is None:
-            h0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)
-            c0 = torch.zeros(5, x.size(0), self.lstm.hidden_size).to(x.device)
+            h0 = torch.zeros(1, x.size(0), self.lstm.hidden_size).to(x.device)
+            c0 = torch.zeros(1, x.size(0), self.lstm.hidden_size).to(x.device)
         else:
             h0, c0 = hidden
+
+        # LSTM forward pass
         lstm_out, (h_n, c_n) = self.lstm(x, (h0, c0))
-        h_n = h_n.detach()
-        c_n = c_n.detach()
-        lstm_out_transpose = lstm_out.permute(1, 0, 2)
-        attn_output, _ = self.attention(lstm_out_transpose, lstm_out_transpose, lstm_out_transpose)
-        attn_output = attn_output.permute(1, 0, 2)
-        context = attn_output[:, -1, :]
 
-        # Fully connected layers with ReLU activations and dropout
-        out = self.fc1(context)
-        out = self.relu(out)
-        out = self.layer_norm(out)  # Layer normalization
-        out = self.dropout(out)
+        # We are only interested in the last output of the sequence (many-to-one)
+        last_hidden_state = lstm_out[:, -1, :]  # Get the last time step's output
 
-        out = self.fc2(out)
+        # Fully connected layers
+        out = self.fc1(last_hidden_state)
         out = self.relu(out)
         out = self.dropout(out)
+        out = self.fc2(out)  # Final output (raw logits)
 
-        out = self.fc3(out)  # Third FC layer
-        out = self.relu(out)
-        out = self.dropout(out)
-
-        out = self.fc4(out)  # Final output (raw logits)
-
-        # Return the output and the new hidden states for the next iteration
-        return out, (h_n, c_n)  # Return the new hidden state and cell state for the next time step
-
+        # Return output and hidden state
+        return out, (h_n, c_n)  # Return the new hidden state and cell state
 # Model initialization
 model = LSTMModel(input_size=len(feature_columns), hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE, dropout_rate=DROPOUT_RATE).to(device)
 
 # Criterion and optimizer
 class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+#malicious_class_index = 0  # Modify this according to your class labels
+#increased_weight = 10.0  # This is the weight multiplier for the malicious class
+#class_weights[malicious_class_index] = increased_weight * class_weights[malicious_class_index]
 class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
 class FocalLoss(nn.Module):
